@@ -241,6 +241,8 @@ class TrophyObserver:
             )
 
     def add_trophies(self, parsed_result: ParsedGameResult, current_brawler, playstyle_info, underdog, power_level=None):
+        if self.current_trophies is None:
+            self.current_trophies = 0
         old_trophies = self.current_trophies
         if old_trophies >= 2000:
             underdog = False
@@ -280,6 +282,7 @@ class TrophyObserver:
         if self.current_wins:
             print(f"Current Wins: {self.current_wins}")
 
+        info = playstyle_info if isinstance(playstyle_info, dict) else {}
         self.match_history.append({
             "date_time": datetime.now().isoformat(),
             "brawler_name": current_brawler,
@@ -287,10 +290,10 @@ class TrophyObserver:
             "current_trophies": old_trophies,
             "trophy_delta": trophy_delta,
             "new_winstreak": self.win_streak,
-            "playstyle_hash": hash_playstyle(playstyle_info),
-            "playstyle_name": playstyle_info["name"],
-            "playstyle_gamemodes": "|".join(playstyle_info["gamemodes"]),
-            "playstyle_brawlers": "|".join(playstyle_info["brawlers"]),
+            "playstyle_hash": hash_playstyle(info),
+            "playstyle_name": info.get("name", ""),
+            "playstyle_gamemodes": "|".join(info.get("gamemodes") or []),
+            "playstyle_brawlers": "|".join(info.get("brawlers") or []),
             "pyla_version": PYLA_VERSION,
             "power_level": power_level if power_level is not None else -1,
         })
@@ -301,6 +304,8 @@ class TrophyObserver:
 
     def add_win(self, parsed_result: ParsedGameResult):
         if parsed_result.result == MatchResult.VICTORY:
+            if not isinstance(self.current_wins, int):
+                self.current_wins = 0
             self.current_wins += 1
 
     def change_trophies(self, new):

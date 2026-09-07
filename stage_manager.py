@@ -8,6 +8,8 @@ from utils import find_template_center, load_toml_as_dict, notify_user, save_bra
 
 def load_image(image_path, scale_factor):
     image = cv2.imread(image_path)
+    if image is None:
+        return None
     orig_height, orig_width = image.shape[:2]
 
     new_width = int(orig_width * scale_factor)
@@ -250,12 +252,17 @@ class StageManager:
         screenshot = self.window_controller.screenshot()
         if self.close_popup_icon is None:
             self.close_popup_icon = load_image("images/states/close_popup.png", self.window_controller.scale_factor)
+        if self.close_popup_icon is None:
+            return
         popup_location = find_template_center(screenshot, self.close_popup_icon)
         if popup_location:
             self.window_controller.click(*popup_location)
 
     def do_state(self, state, data=None):
-        if data is not None:
-            self.states[state](data)
+        action = self.states.get(state)
+        if action is None:
             return
-        self.states[state]()
+        if data is not None:
+            action(data)
+            return
+        action()
