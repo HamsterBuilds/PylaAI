@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 class WebDataService:
     PLAY_ORDER_VALUES = {"in_order", "lowest_to_highest", "highest_to_lowest"}
     INTERFACE_MODE_VALUES = {"desktop", "browser", "headless"}
+    CPU_OR_GPU_VALUES = {"auto", "gpu", "cpu"}
     SECRET_WEBHOOK_FIELDS = {"webhook_url", "discord_bot_token", "telegram_token"}
 
     GENERAL_FIELDS: dict[str, tuple[str, Any]] = {
@@ -56,6 +57,7 @@ class WebDataService:
         "max_fps": ("auto_int", "auto"),
         "interface_mode": ("interface_mode", "desktop"),
         "used_threads": ("auto_int", "auto"),
+        "cpu_or_gpu": ("cpu_or_gpu", "auto"),
         "brawl_stars_package": ("str", "com.supercell.brawlstars"),
         "emulator_port": ("int", 5037),
         "trophies_multiplier": ("int", 1),
@@ -145,6 +147,9 @@ class WebDataService:
         if value_type == "interface_mode":
             value_str = str(value or "").strip().lower()
             return value_str if value_str in self.INTERFACE_MODE_VALUES else "desktop"
+        if value_type == "cpu_or_gpu":
+            value_str = str(value or "").strip().lower()
+            return value_str if value_str in self.CPU_OR_GPU_VALUES else "auto"
         return "" if value is None else str(value)
 
     def _serialize(self, value_type: str, value: Any):
@@ -633,7 +638,7 @@ class WebDataService:
 
         schema, path = schema_map[section]
         
-        # Load the existing configuration to preserve other non-schema keys (like cpu_or_gpu, wall_model_classes)
+        # Load the existing configuration to preserve other non-schema keys (like wall_model_classes)
         config = self._load_config(path)
         
         # Reset schema fields to their default values defined in services.py

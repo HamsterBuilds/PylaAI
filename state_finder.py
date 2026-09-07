@@ -34,10 +34,22 @@ def is_template_in_region(image, template_path, region, threshold=None):
     new_x, new_y = int(orig_x * width_ratio), int(orig_y * height_ratio)
     new_width, new_height = int(orig_width * width_ratio), int(orig_height * height_ratio)
     cropped_image = image[new_y:new_y + new_height, new_x:new_x + new_width]
-    current_height, current_width = image.shape[:2]
     loaded_template = load_template(template_path, current_width, current_height)
-    result = cv2.matchTemplate(cropped_image, loaded_template,
-                               cv2.TM_CCOEFF_NORMED)
+    if loaded_template is None or cropped_image.size == 0:
+        return False
+    if (
+        cropped_image.shape[0] < loaded_template.shape[0]
+        or cropped_image.shape[1] < loaded_template.shape[1]
+    ):
+        return False
+
+    try:
+        result = cv2.matchTemplate(cropped_image, loaded_template, cv2.TM_CCOEFF_NORMED)
+    except cv2.error as e:
+        if should_print_debug_info:
+            print(f"Template matching failed for {template_path}: {e}")
+        return False
+
     min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
     if should_print_debug_info:
         print(f"Template matching for {template_path} in region {region} yielded max_val: {max_val}")
@@ -48,9 +60,12 @@ cached_templates = {}
 def load_template(image_path, width, height):
     if (image_path, width, height) in cached_templates:
         return cached_templates[(image_path, width, height)]
-    current_width_ratio, current_height_ratio = width / orig_screen_width, height / orig_screen_height
     image = cv2.imread(image_path)
+    if image is None:
+        print(f"Could not load template: {image_path}")
+        return None
     orig_height, orig_width = image.shape[:2]
+    current_width_ratio, current_height_ratio = width / orig_screen_width, height / orig_screen_height
     resized_image = cv2.resize(image, (int(orig_width * current_width_ratio), int(orig_height * current_height_ratio)))
     resized_colored_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB)
     cached_templates[(image_path, width, height)] = resized_colored_image

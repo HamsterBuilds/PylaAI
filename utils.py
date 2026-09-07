@@ -70,7 +70,7 @@ def load_toml_as_dict(file_path, cache=True):
 
 def invalidate_toml_cache(file_path):
     full_path = PROJECT_ROOT / str(file_path).lstrip('/\\')
-    del cached_toml[str(full_path)]
+    cached_toml.pop(str(full_path), None)
 
 
 def save_dict_as_toml(data, file_path):
@@ -594,18 +594,6 @@ def cprint(text: str, hex_color: str):
         print(text)
 
 
-def mask_secret(value: str | None, keep: int = 4) -> dict:
-    value = (value or "").strip()
-    if not value:
-        return {"configured": False, "masked": ""}
-    if len(value) <= keep:
-        return {"configured": True, "masked": "•" * len(value)}
-    return {
-        "configured": True,
-        "masked": f"{value[:2]}{'•' * max(len(value) - (keep + 2), 2)}{value[-keep:]}"
-    }
-
-
 def normalize_brawler_filename(brawler_name: str) -> str:
     return str(brawler_name).lower().replace(' ', '').replace('-', '').replace('.', '').replace('&', '')
 
@@ -724,11 +712,11 @@ def load_pyla_script(filename):
         return metadata, pyla_script
     except FileNotFoundError:
         print(f"Error: The playstyle file '{filename}' was not found.")
-        return "", ""
+        return {}, ""
     except Exception as e:
         print(f"An error occurred while loading the .pyla script: {e}")
         traceback.print_exc()
-        return "", ""
+        return {}, ""
 
 
 def get_playstyles_list():

@@ -117,6 +117,7 @@ const SETTINGS_META = {
         { key: "interface_mode", label: "Interface Mode", type: "select", options: [{ value: "desktop", label: "Integrated window" }, { value: "browser", label: "System browser" }, { value: "headless", label: "Headless" }], help: "Choose what Pyla opens at startup. Headless opens no window or browser, but the local web UI remains available. Requires a full restart." },
         { key: "max_fps", label: "Max FPS", type: "text", help: "Processing cap. Use auto if you want Pyla to manage it." },
         { key: "used_threads", label: "Threads", type: "text", help: "Worker thread count. Auto keeps the current behavior." },
+        { key: "cpu_or_gpu", label: "CPU / GPU", type: "select", options: [{ value: "auto", label: "Auto" }, { value: "gpu", label: "GPU" }, { value: "cpu", label: "CPU" }], help: "Inference device. Auto tries CUDA, then DirectML, then CPU. Requires a restart." },
         { key: "trophies_multiplier", label: "Trophies Multiplier", type: "number", help: "Useful for custom arenas or multiplier-based modes." },
         { key: "emulator_port", label: "Emulator Port", type: "number", help: "ADB port used for the emulator instance." },
         { key: "brawl_stars_package", label: "Package Name", type: "text", help: "Android package used when restarting Brawl Stars." },

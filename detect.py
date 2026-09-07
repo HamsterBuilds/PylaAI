@@ -157,7 +157,9 @@ class Detect:
 
         self.optimal_threads_amount = get_optimal_threads() if threads_to_use == "auto" else int(threads_to_use)
         cv2.setNumThreads(self.optimal_threads_amount)
-        self.preferred_device = load_toml_as_dict("cfg/general_config.toml")['cpu_or_gpu']
+        self.preferred_device = str(
+            load_toml_as_dict("cfg/general_config.toml").get("cpu_or_gpu", "auto") or "auto"
+        ).strip().lower()
         self.model_path = model_path
         self.classes = classes
         self.ignore_classes = set(ignore_classes) if ignore_classes else set()
@@ -172,29 +174,33 @@ class Detect:
 
     def load_model(self):
         available_providers = ort.get_available_providers()
-        if self.preferred_device == "gpu" or self.preferred_device == "auto":
-            if "CUDAExecutionProvider" in available_providers:
-                onnx_provider = "CUDAExecutionProvider"
-                print("Using CUDA GPU")
-            elif "DmlExecutionProvider" in available_providers:
-                onnx_provider = "DmlExecutionProvider"
-                print("Using GPU")
-            elif "AzureExecutionProvider" in available_providers:
-                onnx_provider = "AzureExecutionProvider"
-            else:
-                print("Using CPU as no GPU provider found")
-                onnx_provider = "CPUExecutionProvider"
+        providers = []
 
-        else:
-            onnx_provider = "CPUExecutionProvider"
+        if self.preferred_device in ("gpu", "auto"):
+            if "CUDAExecutionProvider" in available_providers:
+                providers.append("CUDAExecutionProvider")
+            if "DmlExecutionProvider" in available_providers:
+                providers.append("DmlExecutionProvider")
+
+        providers.append("CPUExecutionProvider")
+        if self.preferred_device == "cpu":
+            providers = ["CPUExecutionProvider"]
 
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         so.intra_op_num_threads = self.optimal_threads_amount
         so.inter_op_num_threads = self.optimal_threads_amount
-        model = ort.InferenceSession(self.model_path, sess_options=so, providers=[onnx_provider])
+        model = ort.InferenceSession(self.model_path, sess_options=so, providers=providers)
 
-        return model, onnx_provider
+        used_provider = model.get_providers()[0]
+        if used_provider == "CUDAExecutionProvider":
+            print("Using CUDA GPU")
+        elif used_provider == "DmlExecutionProvider":
+            print("Using GPU")
+        elif self.preferred_device != "cpu":
+            print("Using CPU as no GPU provider found")
+
+        return model, used_provider
 
     def preprocess_image(self, img):
         h, w = img.shape[:2]

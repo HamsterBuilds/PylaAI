@@ -12,15 +12,12 @@ PylaAI is currently the best external Brawl Stars bot.
 ## Requirements
 
 - **NVIDIA GPUs**
-  - Automatically installs compatible **CUDA + PyTorch**
-  - Optimized for **GTX 10-series → RTX 50-series**
+  - `setup.py` installs `onnxruntime-gpu` when an NVIDIA GPU is detected
+  - Falls back to DirectML, then CPU, if CUDA does not load
 
-- **AMD GPUs**
-  - Native **ROCm** support for Radeon / Ryzen GPUs
-
-- **Intel / Generic GPUs**
-  - Uses **DirectML** acceleration on Windows
-  - Works well with integrated graphics
+- **AMD / Intel / iGPU**
+  - DirectML on Windows (`onnxruntime-directml`)
+  - CPU fallback if DirectML does not load
 
 ## Installation
 
@@ -75,3 +72,6 @@ This project is **not permitted to be sold or monetized** under [CC BY-NC 4.0](h
 - **bocchi-the-cat**
 - **Ariko842**
 - **Nauwk07**
+- **aetherwtff**
+- **fazelukario**
+- **k00shi**
