@@ -27,10 +27,6 @@ _BUNDLED_WEBVIEW_BINARIES = (
 
 
 def console_log_path() -> Path:
-    if IS_WINDOWS:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            return Path(local_app_data) / "PylaAI" / "pyla.log"
     return Path.cwd() / "pyla.log"
 
 

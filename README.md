@@ -49,7 +49,7 @@ python main.py
 | Flag | Effect |
 | --- | --- |
 | *(none)* | Console visible, UI in the Pyla desktop window |
-| `--no-console` | Hides the console window, output goes to `%LOCALAPPDATA%\PylaAI\pyla.log`. Ignored when Pyla is started from an existing terminal, so your own terminal is never hidden. |
+| `--no-console` | Hides the console window, output goes to `pyla.log` in the current folder. Ignored when Pyla is started from an existing terminal, so your own terminal is never hidden. |
 | `--no-webapp` | Opens the UI in the default browser instead of the desktop window |
 
 
