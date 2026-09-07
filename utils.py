@@ -80,7 +80,7 @@ def save_dict_as_toml(data, file_path):
     cached_toml[str(full_path)] = data
 
 
-reader = DefaultEasyOCR()
+
 try:
     from early_access.early_access import OFFICIAL_API
     default_api = OFFICIAL_API
