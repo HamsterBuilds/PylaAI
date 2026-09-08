@@ -4,7 +4,8 @@ import time
 import cv2
 from utils import (
     count_hsv_pixels,
-    load_toml_as_dict, load_all_brawlers_names, config_bool,
+    load_toml_as_dict, config_bool, load_brawlers_info,
+    normalize_brawler_filename,
 )
 
 
@@ -15,7 +16,6 @@ class LobbyAutomation:
         self.idle_reconnect_coords = load_toml_as_dict("cfg/buttons_config.toml")["idle_reconnect"]
         if self.idle_reconnect_coords and isinstance(self.idle_reconnect_coords[0], (int, float)):
             self.idle_reconnect_coords = [self.idle_reconnect_coords]
-        self.all_brawlers_names = load_all_brawlers_names()
         self.window_controller = window_controller
         self.verbose_debug = config_bool(load_toml_as_dict("cfg/debug_settings.toml").get('verbose_debug'), False)
         self.idle_disconnect_hsv_high_bounds = load_toml_as_dict("cfg/lobby_config.toml").get("hsv_bounds", {}).get("idle_reconnect_high_bounds", [[10, 22, 42], [10, 22, 90], [118, 66, 46]])
@@ -60,21 +60,27 @@ class LobbyAutomation:
         wr = self.window_controller.width_ratio
         hr = self.window_controller.height_ratio
         brawler = str(brawler).lower().strip()
-        for symbol in [' ', '-', '.', "&"]:
-            brawler = brawler.replace(symbol, "")
+        normalized_brawler = normalize_brawler_filename(brawler)
+        brawler_info = load_brawlers_info().get(normalized_brawler, {})
+        brawler_search_name = brawler_info.get("actual_name") or normalized_brawler
 
         x, y = load_toml_as_dict("cfg/buttons_config.toml")["brawlers_menu"]
         self.window_controller.click(x, y, already_include_ratio=False)
         time.sleep(1.25)
-        print("Automatic brawler selection started for", brawler)
+        print("Automatic brawler selection started for", brawler_search_name)
         for i in range(100):
             if self._should_interrupt(runtime_control, stop_event):
                 print("Brawler selection aborted by user.")
                 return "aborted"
             self.window_controller.screenshot()
             current_state = get_latest_state()
+            if current_state == "shop":
+                print("Brawler menu is still opening")
+                time.sleep(1)
+                continue
+
             if current_state != "brawler_selection":
-                print(f"Latest screenshot is no longer of the lobby '{current_state}', aborting brawler selection...")
+                print("Latest screenshot is no longer of the lobby, aborting brawler selection...")
                 return "stuck"
 
             self.window_controller.press("brawler_search")
@@ -82,8 +88,8 @@ class LobbyAutomation:
                 print("Brawler selection aborted by user.")
                 return "aborted"
 
-            if not self.window_controller.type_text(brawler):
-                print(f"Could not enter brawler name '{brawler}' in the search field.")
+            if not self.window_controller.type_text(brawler_search_name):
+                print(f"Could not enter brawler name '{brawler_search_name}' in the search field.")
                 return "error"
             if self._sleep_interruptible(0.5, runtime_control, stop_event):
                 print("Brawler selection aborted by user.")
@@ -101,7 +107,7 @@ class LobbyAutomation:
                 print("Brawler selection aborted by user.")
                 return "aborted"
             self.window_controller.screenshot()
-            print("Selected brawler ", brawler)
+            print("Selected brawler ", brawler_search_name)
             return "success"
 
         print(f"WARNING: Brawler '{brawler}' was not found after 100 scroll attempts.")

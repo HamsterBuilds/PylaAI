@@ -2029,9 +2029,9 @@ function startHistoryPolling() {
 }
 
 function refreshVisibleHistory() {
-    if (document.visibilityState !== "hidden" && state.currentView === "history") {
-        refreshMatchHistory();
-    }
+    // Some embedded WebView versions can report a visible, unfocused window as
+    // hidden. Do not let that pause History updates for the rest of a session.
+    if (state.currentView === "history") return refreshMatchHistory();
 }
 
 
@@ -2043,9 +2043,10 @@ async function refreshRuntimeState() {
         const previousState = state.bootstrap.runtime?.state;
         state.bootstrap.runtime = result.runtime;
         updateSessionTimer();
-        // The visible History view has its own poller so it remains live even if
-        // runtime status polling fails or the selected profile is idle.
-        if (result.runtime.is_running && state.currentView !== "history") await refreshMatchHistory();
+        // Keep this as a second refresh trigger while Pyla is running. The
+        // dedicated History poller can be throttled by an embedded WebView, and
+        // refreshMatchHistory de-duplicates overlapping requests.
+        if (result.runtime.is_running) await refreshMatchHistory();
         if (result.runtime.is_running) await refreshRunningQueue();
         if (previousState !== result.runtime.state) {
             renderDashboard();
@@ -2083,10 +2084,7 @@ async function refreshMatchHistory() {
             }
 
             if (state.currentView === "history") {
-                updateHistorySummary();
-
-                const grid = document.querySelector("#view-history .hist-grid");
-                if (grid) grid.innerHTML = renderHistoryGrid();
+                updateHistoryViewData();
             }
 
             if (state.activeHistoryBrawler) {
@@ -2100,6 +2098,15 @@ async function refreshMatchHistory() {
     });
 
     return state.historyRefreshInFlight;
+}
+
+function updateHistoryViewData() {
+    // Apply one fetched snapshot to both the aggregate counters and the cards.
+    // Keeping this in one function prevents the two History representations
+    // from drifting when the page is refreshed during a running session.
+    updateHistorySummary();
+    const grid = document.querySelector("#view-history .hist-grid");
+    if (grid) grid.innerHTML = renderHistoryGrid();
 }
 
 async function refreshRunningQueue() {
