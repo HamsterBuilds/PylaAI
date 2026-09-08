@@ -569,6 +569,31 @@ input:focus, select:focus { border-color: var(--brand-main); box-shadow: 0 0 0 3
 }
 .brawlers-layout > .panel { min-height: 0; }
 .brawlers-layout > .panel:first-child { display: flex; flex-direction: column; }
+    /*
+     * Windows display scaling reduces pywebview's CSS viewport (for example,
+     * 1920x1080 at 150% is roughly 1280x720). At this breakpoint the editor
+     * moves below the picker, so the picker can no longer rely on flex: 1 in
+     * a fixed-height, two-column layout: that collapses the grid to about one
+     * row and makes only the first brawler appear reachable.
+     *
+     * Give the stacked picker its own scroll viewport and let the main view
+     * scroll far enough to reach the editor below it.
+     */
+    .brawlers-layout {
+        flex: none;
+        height: auto;
+        grid-auto-rows: max-content;
+    }
+
+    .brawlers-layout > .panel:first-child {
+        display: block;
+        min-height: max-content;
+    }
+
+    .brawler-grid-shell {
+        height: clamp(280px, 45vh, 520px);
+    }
+
 .brawlers-layout > .panel:last-child { align-self: start; position: sticky; top: 0; max-height: 100%; overflow-y: auto; }
 .brawler-grid-shell {
     display: grid;
@@ -1241,6 +1266,9 @@ input:focus, select:focus { border-color: var(--brand-main); box-shadow: 0 0 0 3
     grid-template-columns: minmax(200px, 1fr) auto minmax(240px, 320px);
     gap: 12px;
     align-items: end;
+}
+@media (max-width: 720px) {
+    .queue-toolbar-fields { grid-template-columns: 1fr; }
 }
 
 .queue-toolbar .input-group > span {
