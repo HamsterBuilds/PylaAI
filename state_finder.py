@@ -2,6 +2,9 @@ import os
 import sys
 import cv2
 import time
+import threading
+import weakref
+from functools import lru_cache
 sys.path.append(os.path.abspath('/'))
 from utils import load_toml_as_dict, config_bool
 
@@ -22,11 +25,36 @@ end_results_path = r"./images/end_results/"
 
 region_data = load_toml_as_dict("./cfg/lobby_config.toml")['template_matching']
 match_result_crop_region = region_data['match_result']
+STATE_DETECTION_CONFIDENCE = float(
+    load_toml_as_dict("cfg/bot_config.toml").get("state_detection_confidence", 0.75)
+)
+STATE_FINDER_DEBUG = config_bool(
+    load_toml_as_dict("cfg/debug_settings.toml").get('state_finder_debug'), False
+)
+
+# Per worker, cache numeric scores only for the exact same frame object. This
+# avoids copying identical crops once per template and never reuses stale data.
+_match_cache = threading.local()
+
+
+def _template_score(frame, crop, template, key):
+    frame_ref = getattr(_match_cache, 'frame_ref', None)
+    cached_frame = frame_ref() if frame_ref is not None else None
+    if cached_frame is not frame:
+        _match_cache.frame_ref = weakref.ref(frame)
+        _match_cache.scores = {}
+    cache = _match_cache.scores
+    if key in cache:
+        return cache[key]
+    result = cv2.matchTemplate(crop, template, cv2.TM_CCOEFF_NORMED)
+    score = cv2.minMaxLoc(result)[1]
+    cache[key] = score
+    return score
 
 
 def is_template_in_region(image, template_path, region, threshold=None):
     if threshold is None:
-        threshold = load_toml_as_dict("cfg/bot_config.toml").get("state_detection_confidence", 0.75)
+        threshold = STATE_DETECTION_CONFIDENCE
     current_height, current_width = image.shape[:2]
     orig_x, orig_y, orig_width, orig_height = region
     width_ratio, height_ratio = current_width / orig_screen_width, current_height / orig_screen_height
@@ -44,22 +72,22 @@ def is_template_in_region(image, template_path, region, threshold=None):
         return False
 
     try:
-        result = cv2.matchTemplate(cropped_image, loaded_template, cv2.TM_CCOEFF_NORMED)
+        max_val = _template_score(
+            image, cropped_image, loaded_template,
+            (template_path, current_width, current_height, tuple(region))
+        )
     except cv2.error as e:
         if should_print_debug_info:
             print(f"Template matching failed for {template_path}: {e}")
         return False
 
-    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
     if should_print_debug_info:
         print(f"Template matching for {template_path} in region {region} yielded max_val: {max_val}")
     return max_val > threshold
 
 
-cached_templates = {}
+@lru_cache(maxsize=128)
 def load_template(image_path, width, height):
-    if (image_path, width, height) in cached_templates:
-        return cached_templates[(image_path, width, height)]
     image = cv2.imread(image_path)
     if image is None:
         print(f"Could not load template: {image_path}")
@@ -68,7 +96,6 @@ def load_template(image_path, width, height):
     current_width_ratio, current_height_ratio = width / orig_screen_width, height / orig_screen_height
     resized_image = cv2.resize(image, (int(orig_width * current_width_ratio), int(orig_height * current_height_ratio)))
     resized_colored_image = cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB)
-    cached_templates[(image_path, width, height)] = resized_colored_image
     return resized_colored_image
 
 SHOWDOWN_PLACE_THRESHOLD = 0.9
@@ -105,9 +132,8 @@ def find_game_result(screenshot):
 
 def get_in_game_state(image):
     global last_debug_print_time, should_print_debug_info
-    state_finder_debug = config_bool(load_toml_as_dict("cfg/debug_settings.toml").get('state_finder_debug'), False)
     current_time = time.time()
-    should_print_debug_info = state_finder_debug and (current_time - last_debug_print_time >= 1.0)
+    should_print_debug_info = STATE_FINDER_DEBUG and (current_time - last_debug_print_time >= 1.0)
     if should_print_debug_info:
         last_debug_print_time = current_time
 
@@ -196,7 +222,19 @@ def is_underdog(image):
     return is_template_in_region(image, end_results_path + "underdog.png", region_data['underdog'])
 
 
-def get_state(screenshot):
-    state = get_in_game_state(screenshot)
+def get_state(screenshot, previous_state=None):
+    # Prioritize checks that can actually follow the established state. The
+    # caller still requests periodic full scans for unexpected transitions.
+    if previous_state == "match":
+        game_result = is_in_end_of_a_match(screenshot)
+        state = f"end_{game_result}" if game_result else "match"
+    elif previous_state == "lobby" and is_in_lobby(screenshot):
+        state = "lobby"
+    elif previous_state == "match_making" and is_in_match_making(screenshot):
+        state = "match_making"
+    elif previous_state == "brawler_selection" and is_in_brawler_selection(screenshot):
+        state = "brawler_selection"
+    else:
+        state = get_in_game_state(screenshot)
     if config_bool(load_toml_as_dict("cfg/debug_settings.toml").get('state_finder_debug'), False): cv2.imwrite(f"./debug_frames/state_screenshot_{state}_{len(os.listdir('./debug_frames'))}.png", cv2.cvtColor(screenshot, cv2.COLOR_BGR2RGB))
     return state

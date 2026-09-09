@@ -84,7 +84,8 @@ def _normalize_yolo_output(raw_output):
     return prediction
 
 
-def _postprocess_raw(raw_output, conf_tresh=0.6, iou_thresh=0.6):
+def _postprocess_raw(raw_output, conf_tresh=0.6, iou_thresh=0.6,
+                     max_detections_per_class=64):
     prediction = _normalize_yolo_output(raw_output)
 
     n_detections = prediction.shape[0]
@@ -124,6 +125,7 @@ def _postprocess_raw(raw_output, conf_tresh=0.6, iou_thresh=0.6):
         cls_scores = confidences[cls_mask]
 
         keep = _numpy_nms(cls_boxes, cls_scores, iou_thresh)
+        keep = keep[:max_detections_per_class]
 
         if len(keep) == 0:
             continue
@@ -146,7 +148,8 @@ def _postprocess_raw(raw_output, conf_tresh=0.6, iou_thresh=0.6):
 
 
 class Detect:
-    def __init__(self, model_path, ignore_classes=None, classes=None, input_size=(640, 640)):
+    def __init__(self, model_path, ignore_classes=None, classes=None,
+                 input_size=(640, 640), max_detections_per_class=64):
         threads_to_use = load_toml_as_dict("cfg/general_config.toml")['used_threads']
 
         def get_optimal_threads(max_limit=6):
@@ -164,6 +167,7 @@ class Detect:
         self.classes = classes
         self.ignore_classes = set(ignore_classes) if ignore_classes else set()
         self.input_size = input_size
+        self.max_detections_per_class = max(1, int(max_detections_per_class))
         self.model, self.device = self.load_model()
         self.input_name = self.model.get_inputs()[0].name
         self._padded_img_buffer = np.full(
@@ -189,7 +193,14 @@ class Detect:
         so = ort.SessionOptions()
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         so.intra_op_num_threads = self.optimal_threads_amount
-        so.inter_op_num_threads = self.optimal_threads_amount
+        so.inter_op_num_threads = 1
+        # Separate detector pools must not busy-wait while the emulator or
+        # another detector is using this small CPU.
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        so.add_session_config_entry("session.inter_op.allow_spinning", "0")
+        if "DmlExecutionProvider" in providers:
+            so.enable_mem_pattern = False
+            so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         model = ort.InferenceSession(self.model_path, sess_options=so, providers=providers)
 
         used_provider = model.get_providers()[0]
@@ -209,18 +220,23 @@ class Detect:
         new_w = int(w * scale)
         new_h = int(h * scale)
 
+        shape = (new_h, new_w, 3)
+        if getattr(self, "_resize_shape", None) != shape:
+            self._resize_shape = shape
+            self._resize_buffer = np.empty(shape, dtype=np.uint8)
+            # A changed aspect ratio must not leave old image pixels in padding.
+            self._padded_img_buffer.fill(128.0 / 255.0)
         resized_img = cv2.resize(
             img,
             (new_w, new_h),
+            dst=self._resize_buffer,
             interpolation=cv2.INTER_LINEAR
         )
 
-        img_float = resized_img.astype(np.float32, copy=True)
-        np.multiply(img_float, 1.0 / 255.0, out=img_float)
-
-        self._padded_img_buffer[0, 0, :new_h, :new_w] = img_float[:, :, 0]
-        self._padded_img_buffer[0, 1, :new_h, :new_w] = img_float[:, :, 1]
-        self._padded_img_buffer[0, 2, :new_h, :new_w] = img_float[:, :, 2]
+        np.multiply(
+            resized_img.transpose(2, 0, 1), np.float32(1.0 / 255.0),
+            out=self._padded_img_buffer[0, :, :new_h, :new_w],
+        )
 
         return self._padded_img_buffer, new_w, new_h
 
@@ -228,7 +244,8 @@ class Detect:
         detections = _postprocess_raw(
             raw_output,
             conf_tresh=conf_tresh,
-            iou_thresh=0.6
+            iou_thresh=0.6,
+            max_detections_per_class=self.max_detections_per_class,
         )
 
         orig_h, orig_w = orig_img_shape
@@ -245,6 +262,8 @@ class Detect:
                 det[:, 1] *= scale_h
                 det[:, 2] *= scale_w
                 det[:, 3] *= scale_h
+                det[:, [0, 2]] = np.clip(det[:, [0, 2]], 0, orig_w - 1)
+                det[:, [1, 3]] = np.clip(det[:, [1, 3]], 0, orig_h - 1)
                 results.append(det)
 
         return results
@@ -269,9 +288,9 @@ class Detect:
         results = {}
 
         for detection in detections:
-            for row in detection:
-                x1, y1, x2, y2 = int(row[0]), int(row[1]), int(row[2]), int(row[3])
-                class_id = int(row[5])
+            coordinates = detection[:, :4].astype(np.int32, copy=False)
+            class_ids = detection[:, 5].astype(np.int32, copy=False)
+            for box, class_id in zip(coordinates, class_ids):
 
                 if self.classes is None:
                     class_name = str(class_id)
@@ -291,6 +310,6 @@ class Detect:
                 if class_name not in results:
                     results[class_name] = []
 
-                results[class_name].append([x1, y1, x2, y2])
+                results[class_name].append(box.tolist())
 
         return results

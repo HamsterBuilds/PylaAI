@@ -6,6 +6,7 @@ import struct
 import subprocess
 import sys
 import time
+from collections import deque
 from multiprocessing import shared_memory
 
 import cv2
@@ -342,7 +343,9 @@ class DebugClipRecorder:
         self.player_seen_since = None
         self.last_player_seen = None
         self.last_frame_written_at = None
-        self.pending_frames = []
+        self.pending_frames = deque()
+        self.pending_frame_bytes = 0
+        self.pending_frame_budget = 32 * 1024 * 1024
 
     def update(self, image, debug_data, frame_advanced):
         if not debug_data or not frame_advanced:
@@ -356,16 +359,24 @@ class DebugClipRecorder:
             self.last_player_seen = now
             if self.writer is None and now - self.player_seen_since >= self.min_player_seen_before_recording:
                 self.start(now)
-                self.flush_pending_frames()
+                if self.writer is not None:
+                    self.flush_pending_frames()
         else:
             self.player_seen_since = None
 
         if self.writer is None:
             if player_detected:
-                self.pending_frames.append((now, image.copy()))
                 self.prune_pending_frames(now)
+                # Bound raw pre-roll memory, including before the next copy.
+                # Full-HD RGB otherwise costs ~534 MiB for three seconds.
+                while self.pending_frames and self.pending_frame_bytes + image.nbytes > self.pending_frame_budget:
+                    self.pending_frame_bytes -= self.pending_frames.popleft()[1].nbytes
+                if image.nbytes <= self.pending_frame_budget:
+                    self.pending_frames.append((now, image.copy()))
+                    self.pending_frame_bytes += image.nbytes
             else:
                 self.pending_frames.clear()
+                self.pending_frame_bytes = 0
             return
 
         self.write_frame(image, now)
@@ -392,16 +403,14 @@ class DebugClipRecorder:
 
     def prune_pending_frames(self, now):
         keep_seconds = self.min_player_seen_before_recording + self.missing_player_grace
-        self.pending_frames = [
-            (timestamp, frame)
-            for timestamp, frame in self.pending_frames
-            if now - timestamp <= keep_seconds
-        ]
+        while self.pending_frames and now - self.pending_frames[0][0] > keep_seconds:
+            self.pending_frame_bytes -= self.pending_frames.popleft()[1].nbytes
 
     def flush_pending_frames(self):
         for timestamp, frame in self.pending_frames:
             self.write_frame(frame, timestamp)
         self.pending_frames.clear()
+        self.pending_frame_bytes = 0
 
     def start(self, now):
         clip_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_frames", "clips")
@@ -419,6 +428,8 @@ class DebugClipRecorder:
             self.path = None
 
     def stop(self):
+        self.pending_frames.clear()
+        self.pending_frame_bytes = 0
         if self.writer is None:
             return
 

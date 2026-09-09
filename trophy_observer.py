@@ -64,6 +64,7 @@ class TrophyObserver:
 
     def __init__(self):
         self.history_file = resolve_project_path("cfg", "match_history.csv")
+        self.trophy_ledger_file = resolve_project_path("cfg", "brawler_trophies.toml")
         
         self.current_trophies = None
         self.current_wins = None
@@ -93,6 +94,51 @@ class TrophyObserver:
             (float("inf"), (9, 4, -5, -11)),
         ]
         self.trophies_multiplier = int(load_toml_as_dict("./cfg/general_config.toml")["trophies_multiplier"])
+        self.current_brawler = None
+        self.trophy_ledger = self._load_trophy_ledger()
+
+    def _load_trophy_ledger(self):
+        if not self.trophy_ledger_file.exists():
+            return {}
+        try:
+            raw = load_toml_as_dict(self.trophy_ledger_file)
+        except Exception:
+            raw = {}
+        ledger = {}
+        for name, value in (raw.get("trophies", {}) if isinstance(raw, dict) else {}).items():
+            try:
+                ledger[str(name).lower().strip()] = max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+        return ledger
+
+    def _save_trophy_ledger(self):
+        save_dict_as_toml({"trophies": self.trophy_ledger}, self.trophy_ledger_file)
+
+    def select_brawler(self, brawler, fallback_trophies):
+        """Restore the last bot-confirmed total for this brawler."""
+        key = str(brawler).lower().strip()
+        try:
+            fallback = max(0, int(fallback_trophies))
+        except (TypeError, ValueError):
+            fallback = 0
+        self.current_brawler = key
+        confirmed = self.trophy_ledger.get(key)
+        self.current_trophies = fallback if confirmed is None else confirmed
+        if confirmed is None:
+            self.trophy_ledger[key] = fallback
+            self._save_trophy_ledger()
+        elif confirmed != fallback:
+            print(f"Using confirmed trophy count for {brawler}: {confirmed} (queue had {fallback})")
+        return self.current_trophies
+
+    def _remember_current_trophies(self, brawler=None):
+        key = str(brawler or self.current_brawler or "").lower().strip()
+        if not key or self.current_trophies is None:
+            return
+        self.current_brawler = key
+        self.trophy_ledger[key] = max(0, int(self.current_trophies))
+        self._save_trophy_ledger()
 
     def win_streak_gain(self):
         return min(self.win_streak - 1, 10) if self.current_trophies < 2000 else 0
@@ -301,6 +347,7 @@ class TrophyObserver:
         if self.match_counter % 3 == 0:
             self.send_results_to_api()
         self.save_history()
+        self._remember_current_trophies(current_brawler)
 
     def add_win(self, parsed_result: ParsedGameResult):
         if parsed_result.result == MatchResult.VICTORY:
@@ -308,9 +355,10 @@ class TrophyObserver:
                 self.current_wins = 0
             self.current_wins += 1
 
-    def change_trophies(self, new):
+    def change_trophies(self, new, brawler=None):
         print(f"Trophies changed from {self.current_trophies} to {new}")
-        self.current_trophies = new
+        self.current_trophies = max(0, int(new))
+        self._remember_current_trophies(brawler)
 
     def send_results_to_api(self):
         new_matches = self.match_history[self.last_sent_index:]

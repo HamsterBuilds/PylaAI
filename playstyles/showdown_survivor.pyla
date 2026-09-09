@@ -1,6 +1,10 @@
 {"name": "Showdown Survivor", "description": "Follow teammates or try to get closer to the center when no enemies and avoids showdown gas", "brawlers": ["all"], "gamemodes": ["trio showdown"], "author": "Official", "date": "2026-07-04"}
 def no_enemy_movement():
     player_pos = get_entity_pos(player_data)
+    objective_movement = get_recent_objective_movement(player_pos)
+    if objective_movement:
+        return objective_movement
+
     closest_teammate_coords, dist = find_closest_teammate(teammate_data, player_pos, walls)
 
     if not closest_teammate_coords:
@@ -12,43 +16,24 @@ def no_enemy_movement():
         dy = center_y - player_pos[1]
         dist_to_center = math.hypot(dx, dy)
 
-        # If close to center, randomly offset the TARGET coordinate instead
+        # Holding a stable position is better than choosing a new random
+        # direction every inference cycle.
         if dist_to_center < TILE_SIZE * 2:
-            center_x += random.randint(-TILE_SIZE, TILE_SIZE)
-            center_y += random.randint(-TILE_SIZE, TILE_SIZE)
-            dx = center_x - player_pos[0]
-            dy = center_y - player_pos[1]
-            dist_to_center = math.hypot(dx, dy)
+            return (0.0, 0.0)
 
         if dist_to_center > 0:
             direction_x, direction_y = dx, dy
         else:
             direction_x, direction_y = 0.0, 0.0
 
-        movement_options = [(direction_x, direction_y), (direction_x, 0), (0, direction_y)]
-
-        for move in movement_options:
-            if not is_path_blocked(player_data, move, walls):
-                return move
-        return movement_options[0]
-    if dist < TILE_SIZE:
-        alternative_moves = [
-            (0, -JOYSTICK_RADIUS), (-JOYSTICK_RADIUS, 0),
-            (0, JOYSTICK_RADIUS), (JOYSTICK_RADIUS, 0)
-        ]
-        return random.choice(alternative_moves)
+        return (direction_x, direction_y)
+    if dist < TILE_SIZE * 0.65:
+        return (0.0, 0.0)
 
     dx = closest_teammate_coords[0] - player_pos[0]
     dy = closest_teammate_coords[1] - player_pos[1]
 
-    direction_x, direction_y = dx, dy
-    movement_options = [(direction_x, direction_y), (direction_x, 0), (0, direction_y)]
-
-    for move in movement_options:
-        if not is_path_blocked(player_data, move, walls):
-            return move
-    else:
-        return movement_options[0]
+    return (dx, dy)
 
 def avoid_poison_gas():
     opposite_direction = {"up": JOYSTICK_RADIUS, "down": -JOYSTICK_RADIUS, "left": JOYSTICK_RADIUS, "right": -JOYSTICK_RADIUS}
@@ -70,9 +55,9 @@ def avoid_poison_gas():
 brawler_info = brawlers_info.get(brawler)
 if not brawler_info:
     raise ValueError(f"Brawler '{brawler}' not found in brawlers info.")
-must_brawler_hold_attack = must_brawler_hold_attack(brawler, brawlers_info)
+must_hold_attack = must_brawler_hold_attack(brawler, brawlers_info)
 # if a brawler has been holding an attack for its max duration + the bot setting, then we release
-if must_brawler_hold_attack and persistent_data["time_since_holding_attack"] is not None and time.time() - persistent_data["time_since_holding_attack"] >= brawler_info['hold_attack'] + seconds_to_hold_attack_after_reaching_max:
+if must_hold_attack and persistent_data["time_since_holding_attack"] is not None and time.time() - persistent_data["time_since_holding_attack"] >= brawler_info['hold_attack'] + seconds_to_hold_attack_after_reaching_max:
     attack(touch_up=True, touch_down=False)
     persistent_data["time_since_holding_attack"] = None
 
@@ -92,30 +77,16 @@ else:
             movement = no_enemy_movement()
     else:
         #if debug: print("found enemy pos:", enemy_coords)
+        # Refresh the active objective while it is visible. If the target or
+        # box disappears, continue to its last position before regrouping.
+        remember_objective(enemy_coords)
         if not anti_poison_gas_movement:
             direction_x = enemy_coords[0] - player_pos[0]
             direction_y = enemy_coords[1] - player_pos[1]
 
-            # Determine initial movement direction
-            if enemy_distance > safe_range:  # Move towards the enemy
-                movement_options = [(direction_x, direction_y), (direction_x, 0), (0, direction_y)]
-            else:
-                movement_options = [(-direction_x, -direction_y), (-direction_x, 0), (0, -direction_y)]
-
-            # Check for walls and adjust movement
-            for move in movement_options:
-                if not is_path_blocked(player_data, move, walls):
-                    movement = move
-                    break
-            else:
-                alternative_moves = [(0, -JOYSTICK_RADIUS), (-JOYSTICK_RADIUS, 0), (0, JOYSTICK_RADIUS), (JOYSTICK_RADIUS, 0)]
-                random.shuffle(alternative_moves)
-                for move in alternative_moves:
-                    if not is_path_blocked(player_data, move, walls):
-                        movement = move
-                        break
-                else:
-                    movement = movement_options[0]
+            # Aggressive priority: always close the distance to the active
+            # enemy/box. The central navigator finds the shortest valid path.
+            movement = (direction_x, direction_y)
 
         if is_super_ready and persistent_data["time_since_holding_attack"] is None:
             super_type = brawler_info['super_type']
@@ -135,10 +106,14 @@ else:
         if enemy_distance <= attack_range:
             enemy_hittable = is_enemy_hittable(player_pos, enemy_coords, walls, "attack")
             if enemy_hittable:
+                # If the target disappears after this shot (especially a
+                # power-cube box), keep walking to its last position instead
+                # of immediately switching back to teammate following.
+                remember_objective(enemy_coords)
                 if is_gadget_ready and persistent_data["time_since_holding_attack"] is None:
                     use_gadget()
 
-                if not must_brawler_hold_attack:
+                if not must_hold_attack:
                     attack()
                 else:
                     if persistent_data["time_since_holding_attack"] is None:

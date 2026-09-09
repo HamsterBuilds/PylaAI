@@ -1,5 +1,6 @@
 import os
 import socket
+import select
 import struct
 import threading
 import time
@@ -228,6 +229,17 @@ class Client:
         codec = CodecContext.create("h264", "r")
         while self.alive:
             try:
+                # Wait for readable data instead of waking every 10 ms and
+                # raising BlockingIOError on an idle stream. Readiness wakes
+                # immediately when a frame arrives; timeout bounds shutdown.
+                video_socket = self.__video_socket
+                if video_socket is None:
+                    break
+                readable, _, _ = select.select([video_socket], [], [], 0.1)
+                if not self.alive:
+                    break
+                if not readable:
+                    continue
                 raw_h264 = self.__video_socket.recv(0x100000)
                 if raw_h264 == b"":
                     raise ConnectionError("Video stream is disconnected")
@@ -248,7 +260,7 @@ class Client:
                 time.sleep(0.01)
                 if not self.block_frame:
                     self.__send_to_listeners(EVENT_FRAME, None)
-            except (ConnectionError, OSError) as e:  # Socket Closed
+            except (ConnectionError, OSError, ValueError) as e:  # Socket Closed
                 if self.alive:
                     self.__send_to_listeners(EVENT_DISCONNECT)
                     self.stop()

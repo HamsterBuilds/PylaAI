@@ -32,3 +32,7 @@ pyla-v0.9.6.zip
 api/namcheap_app.py
 api/bot.py
 api/ANNOUNCEMENTS.md
+benchmark_frame.png
+cfg/brawler_trophies.toml
+benchmark_captures/
+*.egg-info/

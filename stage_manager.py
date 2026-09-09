@@ -134,11 +134,19 @@ class StageManager:
                 if select_brawler == "aborted" or select_brawler == "stuck":
                     return
                 if select_brawler == "success":
-                    self.Trophy_observer.change_trophies(self.brawlers_pick_data[0]['trophies'])
+                    confirmed = self.Trophy_observer.select_brawler(
+                        self.brawlers_pick_data[0]['brawler'],
+                        self.brawlers_pick_data[0]['trophies'],
+                    )
+                    self.brawlers_pick_data[0]['trophies'] = confirmed
                     self.Trophy_observer.current_wins = self.brawlers_pick_data[0]['wins'] if self.brawlers_pick_data[0]['wins'] != "" else 0
                     self.Trophy_observer.win_streak = self.brawlers_pick_data[0]['win_streak']
             else:
-                self.Trophy_observer.change_trophies(self.brawlers_pick_data[0]['trophies'])
+                confirmed = self.Trophy_observer.select_brawler(
+                    self.brawlers_pick_data[0]['brawler'],
+                    self.brawlers_pick_data[0]['trophies'],
+                )
+                self.brawlers_pick_data[0]['trophies'] = confirmed
                 self.Trophy_observer.current_wins = self.brawlers_pick_data[0]['wins'] if self.brawlers_pick_data[0]['wins'] != "" else 0
                 self.Trophy_observer.win_streak = self.brawlers_pick_data[0]['win_streak']
                 print("Next brawler is in manual mode, waiting 10 seconds to let user switch.")

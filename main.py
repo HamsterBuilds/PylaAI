@@ -129,6 +129,7 @@ from utils import load_toml_as_dict, current_wall_model_is_latest, api_base_url,
     clean_queue, get_discord_link
 from utils import get_brawler_list, update_missing_brawlers_info, check_version, notify_user, update_wall_model_classes, get_latest_wall_model_file, cprint
 from window_controller import WindowController
+from perception import StateConsensus
 
 
 def apply_play_order(queue_data):
@@ -176,10 +177,58 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
             self.stop_event = stop_event
             self.state_lock = threading.Lock()
             self.latest_state_frame_time = 0.0
-            self.max_cached_state_age = 1.0
+            bot_config = load_toml_as_dict("cfg/bot_config.toml")
+            self.max_cached_state_age = max(0.25, float(bot_config.get("maximum_state_age", 1.0)))
+            self.state_consensus = StateConsensus(
+                confirmations=bot_config.get("state_change_confirmations", 2)
+            )
             self.state_checker_stop_event = threading.Event()
             self.state_checker_thread = None
             self.update_trophy_observer()
+
+            # The checker thread reads every field below immediately. Create
+            # them before starting it so a fast first frame cannot race init.
+            time_config = load_toml_as_dict("cfg/time_tresholds.toml")
+            self.match_state_check_interval = max(0.1, float(time_config.get("match_state_check_interval", 0.25)))
+            self.menu_state_check_interval = max(0.05, float(time_config.get("menu_state_check_interval", 0.10)))
+            self.match_probe_interval = max(0.1, float(time_config.get("match_probe_interval", 0.25)))
+            self.last_match_probe = 0.0
+            self.match_probe_confirmations = 0
+            self.full_state_scan_interval = max(
+                0.5, float(time_config.get("full_state_scan_interval", 2.0))
+            )
+            self.last_full_state_scan = 0.0
+            configured_entity_fps = str(
+                load_toml_as_dict("cfg/general_config.toml").get(
+                    "entity_inference_max_fps", "auto"
+                )
+            ).strip().lower()
+            if configured_entity_fps == "auto":
+                logical_cpus = os.cpu_count() or 4
+                # Preserve fast combat reactions, but stop spending the same
+                # inference budget while simply travelling/regrouping.
+                entity_fps = 10 if logical_cpus <= 4 else 12 if logical_cpus <= 8 else 16
+                idle_entity_fps = 7 if logical_cpus <= 4 else 8 if logical_cpus <= 8 else 12
+            else:
+                entity_fps = max(4, min(60, int(configured_entity_fps)))
+                idle_entity_fps = entity_fps
+            if self.max_fps:
+                entity_fps = min(entity_fps, self.max_fps)
+                idle_entity_fps = min(idle_entity_fps, self.max_fps)
+            self.entity_inference_interval = 1.0 / entity_fps
+            self.idle_entity_inference_interval = 1.0 / idle_entity_fps
+            self.entity_combat_memory = 1.5
+            self.last_entity_inference = 0.0
+            self.entity_inference_count = 0
+            self.entity_skip_count = 0
+            self.last_performance_report = time.monotonic()
+            if idle_entity_fps == entity_fps:
+                print(f"Entity AI capped at {entity_fps} FPS for stable frame pacing.")
+            else:
+                print(
+                    f"Entity AI adaptive: {idle_entity_fps} FPS travelling, "
+                    f"{entity_fps} FPS in combat."
+                )
 
             self.run_for_minutes = int(load_toml_as_dict("cfg/general_config.toml")['run_for_minutes'])
             self.webhook_ping_every_minutes = load_toml_as_dict("cfg/webhook_config.toml")['ping_every_x_minutes']
@@ -201,7 +250,10 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
         def update_trophy_observer(self):
             current_brawler_data = self.Stage_manager.brawlers_pick_data[0]
             self.Stage_manager.Trophy_observer.win_streak = current_brawler_data['win_streak']
-            self.Stage_manager.Trophy_observer.current_trophies = current_brawler_data['trophies']
+            confirmed_trophies = self.Stage_manager.Trophy_observer.select_brawler(
+                current_brawler_data['brawler'], current_brawler_data['trophies']
+            )
+            current_brawler_data['trophies'] = confirmed_trophies
             self.Stage_manager.Trophy_observer.current_wins = current_brawler_data['wins'] if current_brawler_data['wins'] != "" else 0
 
         @staticmethod
@@ -269,39 +321,68 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
             if self.state_checker_thread and self.state_checker_thread.is_alive():
                 self.state_checker_thread.join(timeout=1.0)
 
-        def set_latest_state(self, state):
+        def set_latest_state(self, state, frame_time=None):
             with self.state_lock:
                 self.state = state
+                self.latest_state_frame_time = frame_time or time.time()
 
         def get_latest_state(self):
             with self.state_lock:
+                if (
+                    self.state is not None
+                    and time.time() - self.latest_state_frame_time > self.max_cached_state_age
+                ):
+                    return None
                 return self.state
 
-        def handle_detected_state(self, state):
+        def observe_state(self, state, frame_time=None):
+            stable_state = self.state_consensus.observe(state)
+            if stable_state is not None:
+                self.set_latest_state(stable_state, frame_time)
+            return stable_state
+
+        def confirm_match_from_entities(self, frame_time):
+            self.state_consensus.force("match")
+            self.set_latest_state("match", frame_time)
+
+        def handle_detected_state(self, state, observed_at=None):
             if state is None:
                 return
-            self.set_latest_state(state)
+            if observed_at is not None:
+                self.set_latest_state(state, observed_at)
 
             print(f"State: {state}")
             frame_data = None
             self.Stage_manager.do_state(state, frame_data)
             if state != "match":
+                self.Play.reset_perception()
                 self.Play.time_since_last_proceeding = time.time()
 
         def state_checker_loop(self):
             last_checked_frame_time = 0.0
             while not self.state_checker_stop_event.is_set():
-                frame, frame_time = self.window_controller.get_latest_frame()
+                frame, frame_time = self.window_controller.wait_for_frame(
+                    last_checked_frame_time, timeout=0.25
+                )
                 if frame is None or frame_time <= last_checked_frame_time:
-                    self.state_checker_stop_event.wait(0.01)
                     continue
 
                 last_checked_frame_time = frame_time
                 try:
-                    self.set_latest_state(get_state(frame))
+                    scan_now = time.monotonic()
+                    previous_state = self.get_latest_state()
+                    if scan_now - self.last_full_state_scan >= self.full_state_scan_interval:
+                        previous_state = None
+                        self.last_full_state_scan = scan_now
+                    self.observe_state(
+                        get_state(frame, previous_state=previous_state), frame_time
+                    )
                 except Exception as e:
                     print(f"State checker failed: {e}")
-                self.state_checker_stop_event.wait(0.1)
+                # Menus need quick transitions; during a match, entity
+                # inference has priority and end-state checks can run at 4 Hz.
+                interval = self.match_state_check_interval if self.get_latest_state() == "match" else self.menu_state_check_interval
+                self.state_checker_stop_event.wait(interval)
 
         def wait_while_paused(self):
             if not self.runtime_control:
@@ -356,7 +437,7 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
             if c_time - self.time_since_checked_if_brawl_stars_crashed > self.check_if_brawl_stars_crashed_timer:
                 try:
                     opened_app = self.window_controller.device.app_current().package.strip()
-                    if not self.window_controller.is_brawl_stars_running():
+                    if not self.window_controller.is_brawl_stars_running(opened_app):
                         print(f"Brawl stars has crashed, {opened_app} is the app opened ! Restarting...")
                         self.window_controller.device.app_start(self.window_controller.BRAWL_STARS_PACKAGE)
                         time.sleep(3)
@@ -372,12 +453,16 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
         def main(self):
             s_time = time.time()
             c = 0
+            last_processed_frame_time = 0.0
             self.time_since_last_webhook_ping = time.time()
             if self.runtime_control:
                 self.runtime_control.mark_running()
 
             while True:
-                if self.get_latest_state() == "lobby":
+                # One synchronized state read per hot-loop pass.  The state checker
+                # owns updates, so repeated lock acquisitions here only add jitter.
+                loop_state = self.get_latest_state()
+                if loop_state == "lobby":
                     if self.should_stop():
                         self.stop_gracefully()
                         break
@@ -389,8 +474,11 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                             break
                         if self.should_pause():
                             continue
+                        # Pausing can span a state transition; do not use the stale
+                        # pre-pause snapshot for automatic lobby actions.
+                        loop_state = self.get_latest_state()
 
-                if not self.picked_first_brawler and self.get_latest_state() == "lobby":
+                if not self.picked_first_brawler and loop_state == "lobby":
                     if self.Stage_manager.brawlers_pick_data[0]['automatically_pick']:
                         next_brawler_name = self.Stage_manager.brawlers_pick_data[0]['brawler']
                         print("Picking brawler automatically")
@@ -438,9 +526,11 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                     s_time = t_now
                     c = 0
                 self.check_and_handle_brawl_stars_crash()
-                frame = self.window_controller.screenshot()
-
-                _, last_ft = self.window_controller.get_latest_frame()
+                frame, last_ft = self.window_controller.wait_for_frame(
+                    last_processed_frame_time, timeout=0.25
+                )
+                if frame is None:
+                    continue
                 if last_ft > 0 and (t_now - last_ft) > self.window_controller.FRAME_STALE_TIMEOUT:
                     stale_age = t_now - last_ft
                     self.Play.window_controller.release_movement()
@@ -456,12 +546,76 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                             break
                     continue
 
+                # Do not run neural networks repeatedly on the same video frame.
+                # Keep stale-feed recovery above this check active.
+                if last_ft > 0 and last_ft <= last_processed_frame_time:
+                    if self.should_stop():
+                        self.stop_gracefully()
+                        break
+                    continue
                 self.manage_time_tasks(frame)
+
+                # State handlers may wait for menus, matchmaking or reconnects.
+                # Their input frame is then obsolete: infer on the current feed.
+                frame, last_ft = self.window_controller.screenshot(with_timestamp=True)
+                if last_ft > 0 and time.time() - last_ft > self.window_controller.FRAME_STALE_TIMEOUT:
+                    continue
+                last_processed_frame_time = last_ft
 
                 brawler = self.Stage_manager.brawlers_pick_data[0]['brawler']
                 self.Play.current_brawler = brawler
+                current_state = self.get_latest_state()
+                if current_state != "match":
+                    if current_state not in (None, "match_making"):
+                        self.match_probe_confirmations = 0
+                        continue
+                    probe_now = time.monotonic()
+                    if probe_now - self.last_match_probe < self.match_probe_interval:
+                        continue
+                    self.last_match_probe = probe_now
+                    if self.Play.probe_match_started(frame):
+                        self.match_probe_confirmations += 1
+                    else:
+                        self.match_probe_confirmations = 0
+                    if self.match_probe_confirmations < 2:
+                        continue
+                    self.confirm_match_from_entities(last_ft)
+                    self.match_probe_confirmations = 0
+                inference_now = time.monotonic()
+                enemy_seen_recently = (
+                    time.time() - self.Play.time_since_detections.get("enemy", 0.0)
+                    <= self.entity_combat_memory
+                )
+                active_interval = (
+                    self.entity_inference_interval if enemy_seen_recently
+                    else self.idle_entity_inference_interval
+                )
+                if inference_now - self.last_entity_inference < active_interval:
+                    self.entity_skip_count += 1
+                    continue
+                self.last_entity_inference = inference_now
+                self.entity_inference_count += 1
                 self.Play.main(frame, brawler, self)
                 c += 1
+
+                if inference_now - self.last_performance_report >= 30.0:
+                    entity_total = self.entity_inference_count + self.entity_skip_count
+                    wall_total = self.Play.wall_inference_count + self.Play.wall_cache_count
+                    planner = self.Play.path_planner
+                    entity_saved = 100.0 * self.entity_skip_count / max(1, entity_total)
+                    wall_saved = 100.0 * self.Play.wall_cache_count / max(1, wall_total)
+                    path_saved = 100.0 * planner.path_cache_hits / max(1, planner.plan_requests)
+                    poison_total = self.Play.poison_compute_count + self.Play.poison_cache_count
+                    poison_saved = 100.0 * self.Play.poison_cache_count / max(1, poison_total)
+                    print(
+                        "Performance: "
+                        f"entity frames avoided={entity_saved:.1f}%, "
+                        f"wall inferences avoided={wall_saved:.1f}%, "
+                        f"poison scans avoided={poison_saved:.1f}%, "
+                        f"A* cache hits={path_saved:.1f}%, "
+                        f"A* nodes={planner.expanded_nodes}"
+                    )
+                    self.last_performance_report = inference_now
 
                 if self.max_fps:
                     target_period = 1 / self.max_fps

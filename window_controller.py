@@ -1,5 +1,6 @@
 import atexit
 import math
+import os
 import random
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -95,7 +96,7 @@ def discover_device(verbose: bool = False) -> AdbDevice:
         except Exception:
             pass
 
-    with ThreadPoolExecutor(max_workers=len(candidates)) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:
         executor.map(_try, candidates)
 
     devices = online_devices()
@@ -116,6 +117,21 @@ def discover_device(verbose: bool = False) -> AdbDevice:
     return chosen
 
 class WindowController:
+    def _create_scrcpy_client(self):
+        # Cap decoding separately from inference. Preserve full resolution for
+        # the fixed-coordinate controls and template matching.
+        config = load_toml_as_dict("cfg/general_config.toml")
+        configured_fps = str(config.get("capture_max_fps", "auto")).strip().lower()
+        if configured_fps == "auto":
+            logical_cpus = os.cpu_count() or 4
+            capture_fps = 15 if logical_cpus <= 4 else 20 if logical_cpus <= 8 else 30
+        else:
+            capture_fps = max(1, min(120, int(configured_fps)))
+        if self.max_fps != "auto":
+            capture_fps = min(capture_fps, max(1, int(self.max_fps)))
+        return scrcpy.Client(device=self.device, max_width=0,
+                             bitrate=4000000, max_fps=capture_fps)
+
     def __init__(self, max_fps="auto"):
         self.scale_factor = None
         self.width = None
@@ -134,12 +150,16 @@ class WindowController:
             self.device = discover_device(verbose=self.verbose_debug)
             print(f"Connected to device: {self.device.serial}")
 
-            self.frame_lock = threading.Lock()
+            self.frame_lock = threading.Condition()
             self.max_fps = max_fps
-            self.scrcpy_client = scrcpy.Client(device=self.device, max_width=0, bitrate=4000000) if self.max_fps == "auto" else scrcpy.Client(device=self.device, max_width=0, bitrate=4000000, max_fps=self.max_fps)
+            self.scrcpy_client = self._create_scrcpy_client()
             self.last_frame = None
             self.last_frame_time = 0.0
             self.last_joystick_pos = (None, None)
+            bot_config = load_toml_as_dict("cfg/bot_config.toml")
+            self.joystick_update_tolerance = max(
+                0.0, float(bot_config.get("joystick_update_tolerance", 2.0))
+            )
             self.FRAME_STALE_TIMEOUT = 15.0
             self.re_apply_movement = config_bool(
                 load_toml_as_dict("cfg/debug_settings.toml").get("re_apply_movement"),
@@ -152,6 +172,7 @@ class WindowController:
                     with self.frame_lock:
                         self.last_frame = frame
                         self.last_frame_time = time.time()
+                        self.frame_lock.notify_all()
 
             self.scrcpy_client.add_listener(scrcpy.EVENT_FRAME, on_frame)
             self.scrcpy_client.start(threaded=True)
@@ -166,6 +187,18 @@ class WindowController:
 
     def get_latest_frame(self):
         with self.frame_lock:
+            if self.last_frame is None:
+                return None, 0.0
+            return self.last_frame, self.last_frame_time
+
+    def wait_for_frame(self, after_time=0.0, timeout=0.25):
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self.frame_lock:
+            while self.last_frame_time <= after_time:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.frame_lock.wait(remaining)
             if self.last_frame is None:
                 return None, 0.0
             return self.last_frame, self.last_frame_time
@@ -214,9 +247,10 @@ class WindowController:
                     with self.frame_lock:
                         self.last_frame = frame
                         self.last_frame_time = time.time()
+                        self.frame_lock.notify_all()
 
             try:
-                self.scrcpy_client = scrcpy.Client(device=self.device, max_width=0, bitrate=4000000) if self.max_fps == "auto" else scrcpy.Client(device=self.device, max_width=0, bitrate=4000000, max_fps=self.max_fps)
+                self.scrcpy_client = self._create_scrcpy_client()
                 self.scrcpy_client.add_listener(scrcpy.EVENT_FRAME, on_frame)
                 self.scrcpy_client.start(threaded=True)
             except Exception as e:
@@ -245,9 +279,10 @@ class WindowController:
         time.sleep(3)
         print("Brawl stars restarted successfully.")
 
-    def is_brawl_stars_running(self):
+    def is_brawl_stars_running(self, opened_app=None):
         try:
-            opened_app = self.device.app_current().package.strip()
+            if opened_app is None:
+                opened_app = self.device.app_current().package.strip()
             detected_known_package = False
             for package in KNOWN_BS_PACKAGES:
                 if opened_app == package:
@@ -266,7 +301,7 @@ class WindowController:
             print(f"Error checking if Brawl Stars is running: {e}")
             return False
 
-    def screenshot(self):
+    def screenshot(self, with_timestamp=False):
         frame, frame_time = self.get_latest_frame()
 
         deadline = time.time() + 15
@@ -295,7 +330,7 @@ class WindowController:
             self.movement_joystick_x, self.movement_joystick_y = movement_joystick[0] * self.width_ratio, movement_joystick[1] * self.height_ratio
             self.original_movement_joystick = (self.movement_joystick_x, self.movement_joystick_y)
             self.scale_factor = min(self.width_ratio, self.height_ratio)
-        return frame
+        return (frame, frame_time) if with_timestamp else frame
 
     def reset_to_default_resolution(self):
         print("Resetting window controller dimensions to 1920x1080 and updating scale ratios...")
@@ -359,8 +394,11 @@ class WindowController:
             self.last_joystick_pos = (target_x, target_y)
             return
 
-        if not self.re_apply_movement and self.last_joystick_pos == (target_x, target_y):
-            return
+        if not self.re_apply_movement and self.last_joystick_pos[0] is not None:
+            delta_x = target_x - self.last_joystick_pos[0]
+            delta_y = target_y - self.last_joystick_pos[1]
+            if delta_x * delta_x + delta_y * delta_y <= self.joystick_update_tolerance ** 2:
+                return
 
         self.touch_move(target_x, target_y, pointer_id=self.PID_JOYSTICK)
         self.last_joystick_pos = (target_x, target_y)
