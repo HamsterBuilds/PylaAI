@@ -6,6 +6,7 @@ import traceback
 import cv2
 import numpy as np
 import os
+import threading
 import weakref
 
 from detect import Detect
@@ -55,8 +56,6 @@ class Play:
         self.centered_wall_detection = config_bool(bot_config.get("centered_wall_detection"), False)
         self.centered_wall_crop_size = 640
 
-        bot_config = load_toml_as_dict("cfg/bot_config.toml")
-        time_config = load_toml_as_dict("cfg/time_tresholds.toml")
         self.verbose_debug = config_bool(load_toml_as_dict("cfg/debug_settings.toml").get('verbose_debug'), False)
         if self.verbose_debug:
             if not os.path.exists("debug_frames"):
@@ -73,6 +72,8 @@ class Play:
         self.close_tile_detector_model_path = close_tile_detector_model
         self.Detect_tile_detector = None
         self.Detect_centered_tile_detector = None
+        self._wall_model_lock = threading.Lock()
+        self._wall_model_loading = False
         self.wall_scene_gate = SceneChangeGate(
             threshold=bot_config.get("wall_scene_change_threshold", 4.0),
             maximum_age=bot_config.get("wall_detection_maximum_age", 1.25),
@@ -105,7 +106,7 @@ class Play:
         )
         self.wall_detection_confidence = bot_config["wall_detection_confidence"]
         self.entity_detection_confidence = bot_config["entity_detection_confidence"]
-        self.seconds_to_hold_attack_after_reaching_max = load_toml_as_dict("cfg/bot_config.toml")["seconds_to_hold_attack_after_reaching_max"]
+        self.seconds_to_hold_attack_after_reaching_max = bot_config["seconds_to_hold_attack_after_reaching_max"]
         self.minimum_attack_interval = max(
             0.0, float(bot_config.get("minimum_attack_interval", 0.08))
         )
@@ -182,6 +183,15 @@ class Play:
             cell_size=bot_config.get("pathfinding_cell_size", 36),
             cache_seconds=bot_config.get("pathfinding_cache_seconds", 0.25),
         )
+        self.detour_commit_seconds = max(
+            0.2, float(bot_config.get("detour_commit_seconds", 0.9))
+        )
+        self.detour_goal_reset_cosine = math.cos(math.radians(max(
+            20.0, min(90.0, float(bot_config.get("detour_goal_reset_degrees", 55.0)))
+        )))
+        self._detour_heading = None
+        self._detour_goal_heading = None
+        self._detour_expires_at = 0.0
         self.poison_cache_interval = max(
             0.05, float(bot_config.get("poison_detection_interval", 0.2))
         )
@@ -422,16 +432,30 @@ class Play:
         return False
 
     def is_enemy_hittable(self, player_pos, enemy_pos, walls, skill_type):
+        cache_key = (
+            "line_of_sight", skill_type, self.current_brawler,
+            tuple(player_pos), tuple(enemy_pos), id(walls),
+        )
+        if cache_key in self._decision_cache:
+            return self._decision_cache[cache_key]
         if self.can_attack_through_walls(self.current_brawler, skill_type, self.brawlers_info):
-            return True
-        if self.walls_block_line_of_sight(player_pos, enemy_pos, walls):
-            return False
-        return True
+            result = True
+        else:
+            result = not self.walls_block_line_of_sight(player_pos, enemy_pos, walls)
+        self._decision_cache[cache_key] = result
+        return result
 
     def estimate_navigation_cost(self, start, goal, walls):
         """Cheap wall-corner detour estimate used only for target ranking."""
+        cache_key = (
+            "navigation_cost", tuple(start), tuple(goal), id(walls)
+        )
+        cached = self._decision_cache.get(cache_key)
+        if cached is not None:
+            return cached
         direct = self.get_distance(start, goal)
         if not walls:
+            self._decision_cache[cache_key] = direct
             return direct
         radius = PLAYER_HIT_CIRCLE_RADIUS * (self.window_controller.scale_factor or 1)
         margin = radius + 6.0 * (self.window_controller.scale_factor or 1)
@@ -449,7 +473,9 @@ class Play:
                 for corner in corners
             )
             extra += max(0.0, corner_route - direct)
-        return direct + extra
+        result = direct + extra
+        self._decision_cache[cache_key] = result
+        return result
 
     def find_closest_enemy(self, enemy_data, player_coords, walls, skill_type):
         cache_key = (
@@ -460,11 +486,13 @@ class Play:
             return self._decision_cache[cache_key]
         player_pos_x, player_pos_y = player_coords
         closest_hittable_distance = float('inf')
-        closest_unhittable_distance = float('inf')
         closest_hittable = None
-        closest_unhittable = None
-        hittable_candidates = []
-        unhittable_candidates = []
+        fastest_unhittable = None
+        fastest_unhittable_cost = float('inf')
+        matching_hittable = None
+        matching_hittable_delta = float('inf')
+        matching_unhittable = None
+        matching_unhittable_delta = float('inf')
         previous_target = self._target_memory.get(skill_type)
         target_match_limit = self.target_match_distance * (
             self.window_controller.scale_factor or 1.0
@@ -472,12 +500,16 @@ class Play:
         for enemy in enemy_data:
             enemy_pos = self.get_entity_pos(enemy)
             distance = self.get_distance(enemy_pos, player_coords)
+            previous_delta = (
+                self.get_distance(enemy_pos, previous_target)
+                if previous_target is not None else float('inf')
+            )
             # A farther target cannot beat an already hittable target, and
             # blocked targets are only a fallback when none is hittable.
             # Preserve first-in-order tie handling without another wall scan.
             can_match_previous = (
                 previous_target is not None
-                and self.get_distance(enemy_pos, previous_target) <= target_match_limit
+                and previous_delta <= target_match_limit
             )
             if (
                 closest_hittable is not None
@@ -486,58 +518,42 @@ class Play:
             ):
                 continue
             if self.is_enemy_hittable((player_pos_x, player_pos_y), enemy_pos, walls, skill_type):
-                hittable_candidates.append((enemy_pos, distance))
                 if distance < closest_hittable_distance:
                     closest_hittable_distance = distance
                     closest_hittable = [enemy_pos, distance]
+                if can_match_previous and previous_delta < matching_hittable_delta:
+                    matching_hittable_delta = previous_delta
+                    matching_hittable = [enemy_pos, distance]
             else:
-                unhittable_candidates.append((enemy_pos, distance))
-                if distance < closest_unhittable_distance:
-                    closest_unhittable_distance = distance
-                    closest_unhittable = [enemy_pos, distance]
+                navigation_cost = self.estimate_navigation_cost(
+                    player_coords, enemy_pos, walls
+                )
+                if navigation_cost < fastest_unhittable_cost:
+                    fastest_unhittable_cost = navigation_cost
+                    fastest_unhittable = [enemy_pos, distance]
+                if can_match_previous and previous_delta < matching_unhittable_delta:
+                    matching_unhittable_delta = previous_delta
+                    matching_unhittable = [enemy_pos, distance]
         if closest_hittable:
             result = closest_hittable
-            if previous_target is not None:
-                matching = min(
-                    hittable_candidates,
-                    key=lambda item: self.get_distance(item[0], previous_target),
-                    default=None,
-                )
-                if (
-                    matching is not None
-                    and self.get_distance(matching[0], previous_target) <= target_match_limit
-                    and matching[1] <= closest_hittable_distance * self.target_switch_ratio
-                ):
-                    result = [matching[0], matching[1]]
+            if (
+                matching_hittable is not None
+                and matching_hittable[1]
+                    <= closest_hittable_distance * self.target_switch_ratio
+            ):
+                result = matching_hittable
             self._target_memory[skill_type] = result[0]
-        elif closest_unhittable:
-            fastest = min(
-                unhittable_candidates,
-                key=lambda item: self.estimate_navigation_cost(
-                    player_coords, item[0], walls
-                ),
-            )
+        elif fastest_unhittable:
             # Keep pursuing the same blocked target when its route remains
             # competitive. Without this, tiny detector changes can alternate
             # between two boxes/enemies on opposite sides of a wall.
-            if previous_target is not None:
-                matching = min(
-                    unhittable_candidates,
-                    key=lambda item: self.get_distance(item[0], previous_target),
-                    default=None,
+            result = fastest_unhittable
+            if matching_unhittable is not None:
+                matching_cost = self.estimate_navigation_cost(
+                    player_coords, matching_unhittable[0], walls
                 )
-                if matching is not None and self.get_distance(
-                    matching[0], previous_target
-                ) <= target_match_limit:
-                    fastest_cost = self.estimate_navigation_cost(
-                        player_coords, fastest[0], walls
-                    )
-                    matching_cost = self.estimate_navigation_cost(
-                        player_coords, matching[0], walls
-                    )
-                    if matching_cost <= fastest_cost * self.target_switch_ratio:
-                        fastest = matching
-            result = [fastest[0], fastest[1]]
+                if matching_cost <= fastest_unhittable_cost * self.target_switch_ratio:
+                    result = matching_unhittable
             self._target_memory[skill_type] = result[0]
         else:
             result = (None, None)
@@ -700,6 +716,9 @@ class Play:
         self.last_teammate_position = None
         self.last_teammate_seen_at = 0.0
         self.path_planner.reset()
+        self._detour_heading = None
+        self._detour_goal_heading = None
+        self._detour_expires_at = 0.0
         self._poison_cache = None
         self._poison_cache_at = 0.0
         self._poison_cache_player = None
@@ -717,6 +736,14 @@ class Play:
         if magnitude < 1:
             return False
 
+        cache_key = (
+            "path_blocked", tuple(player_box[:4]),
+            round(movement[0], 2), round(movement[1], 2),
+            round(float(distance), 2), id(walls),
+        )
+        if cache_key in self._decision_cache:
+            return self._decision_cache[cache_key]
+
         dx = movement[0] / magnitude * distance
         dy = movement[1] / magnitude * distance
         hit_circle_center, hit_circle_radius = self.get_player_hit_circle(player_box)
@@ -727,9 +754,11 @@ class Play:
         nearby_walls = self._nearby_walls(
             player_box, walls, distance + hit_circle_radius
         )
-        return self.walls_block_swept_circle(
+        result = self.walls_block_swept_circle(
             hit_circle_center, new_pos, hit_circle_radius, nearby_walls
         )
+        self._decision_cache[cache_key] = result
+        return result
 
     def _nearby_walls(self, player_box, walls, radius):
         if not walls:
@@ -771,9 +800,15 @@ class Play:
             start[1] + movement[1] / magnitude * known_distance,
         )
         nearby = self._nearby_walls(player_box, walls, known_distance + player_radius)
-        preferred_heading = self.last_movement if self.last_movement else movement
+        navigation_now = time.monotonic()
+        preferred_heading = (
+            self._detour_heading
+            if self._detour_heading is not None
+            and navigation_now < self._detour_expires_at
+            else self.last_movement if self.last_movement else movement
+        )
         path = self.path_planner.plan(
-            start, goal, nearby, player_radius, time.monotonic(), preferred_heading
+            start, goal, nearby, player_radius, navigation_now, preferred_heading
         )
         if path:
             # Skip grid points already visible from the player. This removes
@@ -783,7 +818,13 @@ class Play:
                 if self._segment_blocked(start, candidate, player_radius, nearby):
                     break
                 waypoint = candidate
-            return waypoint[0] - start[0], waypoint[1] - start[1]
+            result = waypoint[0] - start[0], waypoint[1] - start[1]
+            self._detour_heading = result
+            self._detour_goal_heading = (
+                movement[0] / magnitude, movement[1] / magnitude
+            )
+            self._detour_expires_at = navigation_now + self.detour_commit_seconds
+            return result
 
         # Fully enclosed/noisy detections: deterministic angular fallback.
         offsets = (math.pi / 4, -math.pi / 4, math.pi / 2, -math.pi / 2, math.pi)
@@ -791,11 +832,26 @@ class Play:
         for offset in offsets:
             candidate = self.rotate_movement(movement, offset)
             if not self.is_path_blocked(player_box, candidate, walls, distance=lookahead):
+                self._detour_heading = candidate
+                self._detour_goal_heading = (
+                    movement[0] / magnitude, movement[1] / magnitude
+                )
+                self._detour_expires_at = navigation_now + self.detour_commit_seconds
                 return candidate
         return self.rotate_movement(movement, math.pi)
 
     def navigation_correction(self, movement, player_box, walls):
         magnitude = math.hypot(*movement)
+        if magnitude >= 1 and self._detour_goal_heading is not None:
+            goal_heading = movement[0] / magnitude, movement[1] / magnitude
+            if (
+                goal_heading[0] * self._detour_goal_heading[0]
+                + goal_heading[1] * self._detour_goal_heading[1]
+                < self.detour_goal_reset_cosine
+            ):
+                self._detour_heading = None
+                self._detour_goal_heading = None
+                self._detour_expires_at = 0.0
         direct_distance = min(
             magnitude,
             self.centered_wall_crop_size * 0.45 * self.window_controller.scale_factor,
@@ -805,6 +861,9 @@ class Play:
         if magnitude < 1 or not self.is_path_blocked(
             player_box, movement, walls, distance=direct_distance
         ):
+            self._detour_heading = None
+            self._detour_goal_heading = None
+            self._detour_expires_at = 0.0
             return movement
 
         return self._best_open_movement(movement, player_box, walls)
@@ -1045,10 +1104,8 @@ class Play:
     def get_tile_data(self, frame, player_data=None):
         if self.centered_wall_detection:
             if self.Detect_centered_tile_detector is None:
-                self.Detect_centered_tile_detector = Detect(
-                    self.close_tile_detector_model_path,
-                    classes=self.tile_detector_model_classes,
-                )
+                self.preload_wall_model()
+                return None
             crop, offset_x, offset_y = self.get_centered_wall_crop(frame, player_data)
             tile_data = self.Detect_centered_tile_detector.detect_objects(
                 crop,
@@ -1057,12 +1114,62 @@ class Play:
             return self.offset_tile_data(tile_data, offset_x, offset_y)
 
         if self.Detect_tile_detector is None:
-            self.Detect_tile_detector = Detect(
-                self.tile_detector_model_path,
-                classes=self.tile_detector_model_classes,
-            )
+            self.preload_wall_model()
+            return None
         tile_data = self.Detect_tile_detector.detect_objects(frame, conf_tresh=self.wall_detection_confidence)
         return tile_data
+
+    def preload_wall_model(self):
+        """Load the selected wall detector off the gameplay thread."""
+        target_attribute = (
+            "Detect_centered_tile_detector"
+            if self.centered_wall_detection else "Detect_tile_detector"
+        )
+        if getattr(self, target_attribute) is not None or self._wall_model_loading:
+            return
+        with self._wall_model_lock:
+            if getattr(self, target_attribute) is not None or self._wall_model_loading:
+                return
+            self._wall_model_loading = True
+
+        model_path = (
+            self.close_tile_detector_model_path
+            if self.centered_wall_detection else self.tile_detector_model_path
+        )
+        load_started = time.monotonic()
+
+        def load_detector():
+            try:
+                detector = Detect(
+                    model_path,
+                    classes=self.tile_detector_model_classes,
+                )
+                # Force provider kernels and reusable preprocessing buffers to
+                # initialize during matchmaking, not on the first match frame.
+                warm_height, warm_width = detector.input_size
+                warm_frame = np.zeros(
+                    (warm_height, warm_width, 3), dtype=np.uint8
+                )
+                detector.detect_objects(
+                    warm_frame, conf_tresh=self.wall_detection_confidence
+                )
+                with self._wall_model_lock:
+                    setattr(self, target_attribute, detector)
+                print(
+                    f"Wall navigation model ready in "
+                    f"{time.monotonic() - load_started:.1f}s."
+                )
+            except Exception as error:
+                print(f"Wall model preload failed: {error}")
+            finally:
+                with self._wall_model_lock:
+                    self._wall_model_loading = False
+
+        threading.Thread(
+            target=load_detector,
+            daemon=True,
+            name="pyla-wall-model-loader",
+        ).start()
 
     def process_tile_data(self, tile_data):
         walls = []
@@ -1075,56 +1182,87 @@ class Play:
         return self.merge_collinear_walls(walls), bushes
 
     def merge_collinear_walls(self, walls):
-        """Merge adjacent tiles only when they form the same straight wall."""
+        """Merge straight tile runs in bounded O(n²), preserving L corners."""
         if len(walls) < 2:
             return walls
         gap_limit = self.TILE_SIZE * 0.3 * self.window_controller.scale_factor
-        merged = [list(map(float, wall[:4])) for wall in walls]
-        changed = True
-        while changed:
-            changed = False
-            output = []
-            while merged:
-                current = merged.pop()
-                combined = False
-                for index, other in enumerate(merged):
-                    current_height = max(1.0, current[3] - current[1])
-                    other_height = max(1.0, other[3] - other[1])
-                    y_overlap = max(0.0, min(current[3], other[3]) - max(current[1], other[1]))
-                    horizontal_gap = max(current[0], other[0]) - min(current[2], other[2])
+        boxes = [list(map(float, wall[:4])) for wall in walls]
 
-                    current_width = max(1.0, current[2] - current[0])
-                    other_width = max(1.0, other[2] - other[0])
-                    x_overlap = max(0.0, min(current[2], other[2]) - max(current[0], other[0]))
-                    vertical_gap = max(current[1], other[1]) - min(current[3], other[3])
+        def connected_components(indices, horizontal):
+            parent = {index: index for index in indices}
 
-                    same_row = (
-                        current_width >= current_height * 0.8
-                        and other_width >= other_height * 0.8
-                        and
-                        y_overlap >= min(current_height, other_height) * 0.72
-                        and horizontal_gap <= gap_limit
-                    )
-                    same_column = (
-                        current_height >= current_width * 0.8
-                        and other_height >= other_width * 0.8
-                        and
-                        x_overlap >= min(current_width, other_width) * 0.72
-                        and vertical_gap <= gap_limit
-                    )
-                    if not (same_row or same_column):
-                        continue
-                    merged[index] = [
-                        min(current[0], other[0]), min(current[1], other[1]),
-                        max(current[2], other[2]), max(current[3], other[3]),
-                    ]
-                    combined = True
-                    changed = True
-                    break
-                if not combined:
-                    output.append(current)
-            merged = output
-        return [[round(value) for value in wall] for wall in merged]
+            def find(index):
+                while parent[index] != index:
+                    parent[index] = parent[parent[index]]
+                    index = parent[index]
+                return index
+
+            def union(first, second):
+                first_root, second_root = find(first), find(second)
+                if first_root != second_root:
+                    parent[second_root] = first_root
+
+            for offset, first_index in enumerate(indices):
+                first = boxes[first_index]
+                first_width = max(1.0, first[2] - first[0])
+                first_height = max(1.0, first[3] - first[1])
+                for second_offset in range(offset + 1, len(indices)):
+                    second_index = indices[second_offset]
+                    second = boxes[second_index]
+                    second_width = max(1.0, second[2] - second[0])
+                    second_height = max(1.0, second[3] - second[1])
+                    if horizontal:
+                        overlap = max(
+                            0.0, min(first[3], second[3])
+                            - max(first[1], second[1])
+                        )
+                        gap = max(first[0], second[0]) - min(first[2], second[2])
+                        aligned = (
+                            first_width >= first_height * 0.8
+                            and second_width >= second_height * 0.8
+                            and overlap >= min(first_height, second_height) * 0.72
+                        )
+                    else:
+                        overlap = max(
+                            0.0, min(first[2], second[2])
+                            - max(first[0], second[0])
+                        )
+                        gap = max(first[1], second[1]) - min(first[3], second[3])
+                        aligned = (
+                            first_height >= first_width * 0.8
+                            and second_height >= second_width * 0.8
+                            and overlap >= min(first_width, second_width) * 0.72
+                        )
+                    if aligned and gap <= gap_limit:
+                        union(first_index, second_index)
+
+            groups = {}
+            for index in indices:
+                groups.setdefault(find(index), []).append(index)
+            return list(groups.values())
+
+        all_indices = list(range(len(boxes)))
+        horizontal_groups = connected_components(all_indices, horizontal=True)
+        output = []
+        remaining = []
+        for group in horizontal_groups:
+            if len(group) == 1:
+                remaining.extend(group)
+                continue
+            members = [boxes[index] for index in group]
+            output.append([
+                min(box[0] for box in members), min(box[1] for box in members),
+                max(box[2] for box in members), max(box[3] for box in members),
+            ])
+
+        for group in connected_components(remaining, horizontal=False):
+            members = [boxes[index] for index in group]
+            output.append([
+                min(box[0] for box in members), min(box[1] for box in members),
+                max(box[2] for box in members), max(box[3] for box in members),
+            ])
+
+        return [[round(value) for value in wall] for wall in output]
 
     def get_movement(self):
         if self._playstyle_globals is not None:
@@ -1218,13 +1356,20 @@ class Play:
             if refresh_walls:
                 self.wall_inference_count += 1
                 tile_data = self.get_tile_data(frame, data.get("player"))
-                walls, bushes = self.process_tile_data(tile_data)
-                self.time_since_walls_checked = current_time
-                self.last_walls_data = walls
-                data['wall'] = walls
-                self.last_bushes_data = bushes
-                data['bush'] = bushes
-                self.wall_scene_gate.accept(wall_sample, current_time)
+                if tile_data is None:
+                    # The model is still warming during matchmaking. Keep the
+                    # entity AI moving and retry walls on a later frame.
+                    self.wall_inference_count -= 1
+                    data['wall'] = self.last_walls_data
+                    data['bush'] = self.last_bushes_data
+                else:
+                    walls, bushes = self.process_tile_data(tile_data)
+                    self.time_since_walls_checked = current_time
+                    self.last_walls_data = walls
+                    data['wall'] = walls
+                    self.last_bushes_data = bushes
+                    data['bush'] = bushes
+                    self.wall_scene_gate.accept(wall_sample, current_time)
             else:
                 self.wall_cache_count += 1
                 data['wall'] = self.last_walls_data

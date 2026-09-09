@@ -8,6 +8,7 @@ import argparse
 import json
 from pathlib import Path
 import subprocess
+import sys
 import time
 import types
 import cv2
@@ -25,11 +26,48 @@ def source_module(name):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('images', nargs='+')
-    parser.add_argument('--version', choices=['baseline', 'current'], required=True)
+    parser.add_argument(
+        '--version', choices=['baseline', 'current', 'compare'], default='compare'
+    )
     parser.add_argument('--cycles', type=int, default=60)
     args = parser.parse_args()
     if args.cycles < 1:
         parser.error('cycles must be positive')
+    if args.version == 'compare':
+        results = {}
+        for version in ('baseline', 'current'):
+            command = [
+                sys.executable, str(Path(__file__).resolve()), *args.images,
+                '--version', version, '--cycles', str(args.cycles),
+            ]
+            completed = subprocess.run(
+                command, check=True, capture_output=True, text=True
+            )
+            print(completed.stdout, end='')
+            json_lines = [
+                line for line in completed.stdout.splitlines()
+                if line.lstrip().startswith('{')
+            ]
+            if not json_lines:
+                raise RuntimeError(f'No benchmark JSON returned for {version}')
+            results[version] = json.loads(json_lines[-1])
+
+        baseline, current = results['baseline'], results['current']
+        cpu_reduction = 100.0 * (
+            baseline['cpu_seconds'] - current['cpu_seconds']
+        ) / max(baseline['cpu_seconds'], 1e-9)
+        median_reduction = 100.0 * (
+            baseline['work_median_ms'] - current['work_median_ms']
+        ) / max(baseline['work_median_ms'], 1e-9)
+        target_met = cpu_reduction >= 40.0 and median_reduction >= 40.0
+        print(f'CPU reduction: {cpu_reduction:.1f}%')
+        print(f'Median work-time reduction: {median_reduction:.1f}%')
+        print(
+            'OPTIMIZATION TARGET: '
+            + ('PASS' if target_met else 'NOT YET')
+            + ' (requires >=40% CPU and median work-time reduction)'
+        )
+        return
     if args.version == 'baseline':
         detector, states = source_module('detect'), source_module('state_finder')
     else:

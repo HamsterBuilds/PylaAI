@@ -23,6 +23,10 @@ class LocalPathPlanner:
         self.path_cache_hits = 0
         self.occupancy_rebuilds = 0
         self.expanded_nodes = 0
+        self.routes_found = 0
+        self.routes_failed = 0
+        self.raw_waypoints = 0
+        self.smoothed_waypoints = 0
 
     def reset(self):
         self._cache_key = None
@@ -72,13 +76,9 @@ class LocalPathPlanner:
         return enter <= leave
 
     @classmethod
-    def _segment_clear(cls, start, end, walls, padding):
-        for wall in walls:
-            expanded = (
-                wall[0] - padding, wall[1] - padding,
-                wall[2] + padding, wall[3] + padding,
-            )
-            if cls._segment_intersects_rect(start, end, expanded):
+    def _segment_clear(cls, start, end, expanded_walls):
+        for wall in expanded_walls:
+            if cls._segment_intersects_rect(start, end, wall):
                 return False
         return True
 
@@ -87,6 +87,13 @@ class LocalPathPlanner:
         """Replace grid staircases with the farthest collision-free waypoints."""
         if len(path) < 2:
             return path
+        expanded_walls = tuple(
+            (
+                wall[0] - padding, wall[1] - padding,
+                wall[2] + padding, wall[3] + padding,
+            )
+            for wall in walls
+        )
         points = [start, *path]
         smoothed = []
         anchor_index = 0
@@ -94,7 +101,7 @@ class LocalPathPlanner:
         while anchor_index < last_index:
             next_index = last_index
             while next_index > anchor_index + 1 and not cls._segment_clear(
-                points[anchor_index], points[next_index], walls, padding
+                points[anchor_index], points[next_index], expanded_walls
             ):
                 next_index -= 1
             smoothed.append(points[next_index])
@@ -153,7 +160,10 @@ class LocalPathPlanner:
                 preferred_angle = math.atan2(py, px)
         heading_key = None if preferred_angle is None else round(preferred_angle / (math.pi / 8))
         key = (start_cell, goal_cell, occupancy_key, heading_key)
-        if key == self._cache_key and now < self._cache_until:
+        # The key already contains every path-affecting input (start/goal grid
+        # cells, occupancy and preferred heading). Time-based expiry only
+        # repeated identical A* work; invalidate strictly on content changes.
+        if key == self._cache_key:
             self.path_cache_hits += 1
             return list(self._cache_path)
 
@@ -187,11 +197,38 @@ class LocalPathPlanner:
             return cell != start_cell and cell in blocked
 
         if is_blocked(goal_cell):
-            free = [(x, y) for x in range(size) for y in range(size)
-                    if not is_blocked((x, y))]
-            if not free:
+            # Search expanding perimeters instead of allocating/scoring every
+            # cell in the grid. Within the nearest ring prefer the player's
+            # side of the obstacle, avoiding pointless routes behind a target.
+            replacement = None
+            gx, gy = goal_cell
+            for radius in range(1, size):
+                candidates = []
+                min_x, max_x = max(0, gx - radius), min(size - 1, gx + radius)
+                min_y, max_y = max(0, gy - radius), min(size - 1, gy + radius)
+                for x in range(min_x, max_x + 1):
+                    for y in (min_y, max_y):
+                        cell = (x, y)
+                        if not is_blocked(cell):
+                            candidates.append(cell)
+                for y in range(min_y + 1, max_y):
+                    for x in (min_x, max_x):
+                        cell = (x, y)
+                        if not is_blocked(cell):
+                            candidates.append(cell)
+                if candidates:
+                    replacement = min(
+                        candidates,
+                        key=lambda cell: (
+                            self._octile_distance(start_cell, cell),
+                            (to_point(cell)[0] - local_goal[0]) ** 2
+                            + (to_point(cell)[1] - local_goal[1]) ** 2,
+                        ),
+                    )
+                    break
+            if replacement is None:
                 return []
-            goal_cell = min(free, key=lambda cell: self._distance(to_point(cell), local_goal))
+            goal_cell = replacement
 
         queue = [(0.0, 0.0, start_cell)]
         came_from, cost = {}, {start_cell: 0.0}
@@ -240,9 +277,15 @@ class LocalPathPlanner:
                 path.append(to_point(cursor))
                 cursor = came_from[cursor]
             path.reverse()
+            raw_count = len(path)
             path = self._smooth_path(
                 start, path, walls, player_radius + self.cell_size * 0.18
             )
+            self.routes_found += 1
+            self.raw_waypoints += raw_count
+            self.smoothed_waypoints += len(path)
+        else:
+            self.routes_failed += 1
         self._cache_key, self._cache_until = key, now + self.cache_seconds
         self._cache_path = path
         return list(path)

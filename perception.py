@@ -73,36 +73,44 @@ class DetectionStabilizer:
 
     def _update_class(self, name, detections):
         tracks = self._tracks[name]
-        available = set(range(len(tracks)))
+        matched = [False] * len(tracks)
         updated = []
 
         for raw_box in detections[:self.max_tracks]:
             box = [float(value) for value in raw_box[:4]]
             index = None
             best_score = -1.0
-            for candidate_index in available:
-                score = self._match_score(tracks[candidate_index].box, box)
+            for candidate_index, candidate in enumerate(tracks):
+                if matched[candidate_index]:
+                    continue
+                score = self._match_score(candidate.box, box)
                 if score is not None and score > best_score:
                     index = candidate_index
                     best_score = score
             if index is not None:
-                available.remove(index)
-                previous = tracks[index].box
+                matched[index] = True
+                track = tracks[index]
+                previous = track.box
                 alpha = self.smoothing
-                smoothed = [previous[i] + (box[i] - previous[i]) * alpha for i in range(4)]
-                old_velocity = tracks[index].velocity or [0.0] * 4
                 velocity_alpha = self.velocity_smoothing
-                velocity = [
-                    old_velocity[i] * (1.0 - velocity_alpha)
-                    + (box[i] - previous[i]) * velocity_alpha
-                    for i in range(4)
-                ]
-                updated.append(_Track(smoothed, velocity))
+                if track.velocity is None:
+                    track.velocity = [0.0, 0.0, 0.0, 0.0]
+                for coordinate in range(4):
+                    delta = box[coordinate] - previous[coordinate]
+                    track.velocity[coordinate] = (
+                        track.velocity[coordinate] * (1.0 - velocity_alpha)
+                        + delta * velocity_alpha
+                    )
+                    previous[coordinate] += delta * alpha
+                track.missed = 0
+                updated.append(track)
             else:
                 updated.append(_Track(box))
 
         max_misses = self._MAX_MISSES[name]
-        for index in available:
+        for index, was_matched in enumerate(matched):
+            if was_matched:
+                continue
             track = tracks[index]
             track.missed += 1
             if track.missed <= max_misses and len(updated) < self.max_tracks:

@@ -149,9 +149,12 @@ def apply_play_order(queue_data):
 def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
     class Main:
         def __init__(self):
-            current_playstyle = load_toml_as_dict("cfg/bot_config.toml").get("current_playstyle", "default_up.pyla")
+            bot_config = load_toml_as_dict("cfg/bot_config.toml")
+            general_config = load_toml_as_dict("cfg/general_config.toml")
+            time_config = load_toml_as_dict("cfg/time_tresholds.toml")
+            current_playstyle = bot_config.get("current_playstyle", "default_up.pyla")
             try:
-                self.max_fps = int(load_toml_as_dict("cfg/general_config.toml")['max_fps'])
+                self.max_fps = int(general_config['max_fps'])
             except ValueError:
                 self.max_fps = None
 
@@ -177,7 +180,6 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
             self.stop_event = stop_event
             self.state_lock = threading.Lock()
             self.latest_state_frame_time = 0.0
-            bot_config = load_toml_as_dict("cfg/bot_config.toml")
             self.max_cached_state_age = max(0.25, float(bot_config.get("maximum_state_age", 1.0)))
             self.state_consensus = StateConsensus(
                 confirmations=bot_config.get("state_change_confirmations", 2)
@@ -188,7 +190,6 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
 
             # The checker thread reads every field below immediately. Create
             # them before starting it so a fast first frame cannot race init.
-            time_config = load_toml_as_dict("cfg/time_tresholds.toml")
             self.match_state_check_interval = max(0.1, float(time_config.get("match_state_check_interval", 0.25)))
             self.menu_state_check_interval = max(0.05, float(time_config.get("menu_state_check_interval", 0.10)))
             self.match_probe_interval = max(0.1, float(time_config.get("match_probe_interval", 0.25)))
@@ -199,9 +200,7 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
             )
             self.last_full_state_scan = 0.0
             configured_entity_fps = str(
-                load_toml_as_dict("cfg/general_config.toml").get(
-                    "entity_inference_max_fps", "auto"
-                )
+                general_config.get("entity_inference_max_fps", "auto")
             ).strip().lower()
             if configured_entity_fps == "auto":
                 logical_cpus = os.cpu_count() or 4
@@ -230,7 +229,7 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                     f"{entity_fps} FPS in combat."
                 )
 
-            self.run_for_minutes = int(load_toml_as_dict("cfg/general_config.toml")['run_for_minutes'])
+            self.run_for_minutes = int(general_config['run_for_minutes'])
             self.webhook_ping_every_minutes = load_toml_as_dict("cfg/webhook_config.toml")['ping_every_x_minutes']
             self.time_since_last_webhook_ping = time.time()
             self.start_time = time.time()
@@ -244,7 +243,7 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
             print("Initialization complete, starting main loop.")
             self.picked_first_brawler = False
             self.time_since_checked_if_brawl_stars_crashed = time.time()
-            self.check_if_brawl_stars_crashed_timer = load_toml_as_dict("cfg/time_tresholds.toml")["check_if_brawl_stars_crashed"]
+            self.check_if_brawl_stars_crashed_timer = time_config["check_if_brawl_stars_crashed"]
             self.ping_when_stuck = load_toml_as_dict("cfg/webhook_config.toml")["ping_when_stuck"]
 
         def update_trophy_observer(self):
@@ -569,6 +568,8 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                     if current_state not in (None, "match_making"):
                         self.match_probe_confirmations = 0
                         continue
+                    if current_state == "match_making":
+                        self.Play.preload_wall_model()
                     probe_now = time.monotonic()
                     if probe_now - self.last_match_probe < self.match_probe_interval:
                         continue
@@ -605,6 +606,9 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                     entity_saved = 100.0 * self.entity_skip_count / max(1, entity_total)
                     wall_saved = 100.0 * self.Play.wall_cache_count / max(1, wall_total)
                     path_saved = 100.0 * planner.path_cache_hits / max(1, planner.plan_requests)
+                    waypoint_reduction = 100.0 * (
+                        planner.raw_waypoints - planner.smoothed_waypoints
+                    ) / max(1, planner.raw_waypoints)
                     poison_total = self.Play.poison_compute_count + self.Play.poison_cache_count
                     poison_saved = 100.0 * self.Play.poison_cache_count / max(1, poison_total)
                     print(
@@ -613,7 +617,9 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                         f"wall inferences avoided={wall_saved:.1f}%, "
                         f"poison scans avoided={poison_saved:.1f}%, "
                         f"A* cache hits={path_saved:.1f}%, "
-                        f"A* nodes={planner.expanded_nodes}"
+                        f"A* nodes={planner.expanded_nodes}, "
+                        f"path waypoint reduction={waypoint_reduction:.1f}%, "
+                        f"routes={planner.routes_found}/{planner.routes_failed}"
                     )
                     self.last_performance_report = inference_now
 

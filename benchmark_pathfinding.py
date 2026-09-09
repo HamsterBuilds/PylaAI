@@ -148,14 +148,29 @@ def main():
         (success_rate - legacy_success_rate) / max(legacy_success_rate, 1.0) * 100
     )
     turn_reduction = (legacy_turns - new_turns) / max(legacy_turns, 1) * 100
+    waypoint_reduction = 100.0 * (
+        planner.raw_waypoints - planner.smoothed_waypoints
+    ) / max(1, planner.raw_waypoints)
     hit_rate = planner.path_cache_hits / max(1, planner.plan_requests) * 100
     print("------------------------------------------------------------------------")
     print(f"Legacy route success: {legacy_success_rate:.1f}%")
     print(f"A* route success: {success_rate:.1f}%")
     print(f"Relative success improvement: {relative_success_gain:.1f}%")
     print(f"Direction-change reduction: {turn_reduction:.1f}%")
+    print(f"A* waypoint reduction after smoothing: {waypoint_reduction:.1f}%")
+    print(f"A* routes found/failed: {planner.routes_found}/{planner.routes_failed}")
     print(f"Cached {args.repetitions} requests: {cached_ms:.2f} ms")
     print(f"A* cache hit rate: {hit_rate:.1f}%")
+    path_target_met = (
+        successful == len(SCENARIOS)
+        and max(relative_success_gain, turn_reduction) >= 80.0
+    )
+    print(
+        "PATHFINDING TARGET: "
+        + ("PASS" if path_target_met else "NOT YET")
+        + " (requires collision-free success in every scenario and >=80% "
+          "improvement in route success or direction changes)"
+    )
 
 
 if __name__ == "__main__":
