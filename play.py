@@ -42,6 +42,14 @@ class Play:
         self.is_hypercharge_ready = False
         self.time_since_super_checked = time.time()
         self.is_super_ready = False
+        self.ability_rearm_delay = max(
+            0.25, float(bot_config.get("ability_rearm_delay", 1.0))
+        )
+        self._ability_used_at = {
+            "gadget": 0.0,
+            "hypercharge": 0.0,
+            "super": 0.0,
+        }
         self.window_controller = window_controller
         self.TILE_SIZE = bot_config.get("perceived_tile_size", 54)
         self.centered_wall_detection = config_bool(bot_config.get("centered_wall_detection"), False)
@@ -214,19 +222,25 @@ class Play:
         print("Using hypercharge")
         self.window_controller.press("hypercharge")
         self.time_since_hypercharge_checked = time.time()
+        self._ability_used_at["hypercharge"] = time.monotonic()
         self.is_hypercharge_ready = False
 
     def use_gadget(self):
         print("Using gadget")
         self.window_controller.press("gadget")
         self.time_since_gadget_checked = time.time()
+        self._ability_used_at["gadget"] = time.monotonic()
         self.is_gadget_ready = False
 
     def use_super(self):
         print("Using super")
         self.window_controller.press("super")
         self.time_since_super_checked = time.time()
+        self._ability_used_at["super"] = time.monotonic()
         self.is_super_ready = False
+
+    def ability_can_recheck(self, name):
+        return time.monotonic() - self._ability_used_at[name] >= self.ability_rearm_delay
 
     def remember_objective(self, position):
         if position is None or len(position) < 2:
@@ -689,6 +703,8 @@ class Play:
         self._poison_cache = None
         self._poison_cache_at = 0.0
         self._poison_cache_player = None
+        for ability in self._ability_used_at:
+            self._ability_used_at[ability] = 0.0
 
     def is_path_blocked(self, player_box, move_direction, walls, distance=None):
         if distance is None:
@@ -1243,13 +1259,19 @@ class Play:
             self.publish_debug_view(frame, data, state)
             return
         self.time_since_last_proceeding = time.time()
-        if not self.is_hypercharge_ready and current_time - self.time_since_hypercharge_checked > self.hypercharge_treshold:
+        if (not self.is_hypercharge_ready
+                and self.ability_can_recheck("hypercharge")
+                and current_time - self.time_since_hypercharge_checked > self.hypercharge_treshold):
             self.is_hypercharge_ready = self.check_if_hypercharge_ready(frame)
             self.time_since_hypercharge_checked = current_time
-        if not self.is_gadget_ready and current_time - self.time_since_gadget_checked > self.gadget_treshold:
+        if (not self.is_gadget_ready
+                and self.ability_can_recheck("gadget")
+                and current_time - self.time_since_gadget_checked > self.gadget_treshold):
             self.is_gadget_ready = self.check_if_gadget_ready(frame)
             self.time_since_gadget_checked = current_time
-        if not self.is_super_ready and current_time - self.time_since_super_checked > self.super_treshold:
+        if (not self.is_super_ready
+                and self.ability_can_recheck("super")
+                and current_time - self.time_since_super_checked > self.super_treshold):
             self.is_super_ready = self.check_if_super_ready(frame)
             self.time_since_super_checked = current_time
         self.frame = frame

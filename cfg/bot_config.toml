@@ -1,6 +1,7 @@
 minimum_movement_delay = 0.1
 movement_direction_hysteresis_degrees = 8.0
 minimum_attack_interval = 0.08
+ability_rearm_delay = 1.0
 objective_memory_duration = 2.4
 objective_arrival_tiles = 0.65
 teammate_memory_duration = 3.0
