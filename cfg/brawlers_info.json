@@ -90,6 +90,7 @@
         "hold_attack": 0
     },
     "elprimo": {
+        "actual_name": "El Primo",
         "safe_range": 0.0,
         "attack_range": 192.0,
         "super_type": "charge",
@@ -234,6 +235,7 @@
         "hold_attack": 0
     },
     "8bit": {
+        "actual_name": "8-Bit",
         "safe_range": 393.0,
         "attack_range": 640.0,
         "super_type": "spawnable",
@@ -270,6 +272,7 @@
         "hold_attack": 0
     },
     "mrp": {
+        "actual_name": "Mr. P",
         "safe_range": 275.0,
         "attack_range": 448.0,
         "super_type": "spawnable",
@@ -549,6 +552,7 @@
         "hold_attack": 0
     },
     "rt": {
+        "actual_name": "R-T",
         "safe_range": 393.0,
         "attack_range": 640.0,
         "super_type": "spawnable",
@@ -756,6 +760,7 @@
         "hold_attack": 0
     },
     "larrylawrie": {
+        "actual_name": "Larry & Lawrie",
         "safe_range": 288.0,
         "attack_range": 469.0,
         "super_type": "spawnable",
@@ -828,6 +833,7 @@
         "hold_attack": 0
     },
     "jaeyong": {
+        "actual_name": "Jae-Yong",
         "safe_range": 328,
         "attack_range": 533,
         "super_type": "other",
@@ -927,6 +933,7 @@
         "hold_attack": 0
     },
     "starrnova": {
+        "actual_name": "Starr Nova",
         "attack_range": 363,
         "ignore_walls_for_attacks": false,
         "ignore_walls_for_supers": false,

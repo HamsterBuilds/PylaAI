@@ -141,20 +141,6 @@ def load_brawler_data():
         print(f"Error loading queue data from {queue_path}: {e}")
         return []
 
-def load_all_brawlers_names():
-    brawler_names_path = resolve_project_path("cfg", "names.json")
-    if not brawler_names_path.exists():
-        return {}
-    try:
-        with open(brawler_names_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception as e:
-        traceback.print_exc()
-        print(f"Error loading brawler names from {brawler_names_path}: {e}")
-        return {}
-
-
 def api_update_brawler_data(brawler_data):
     # The public edition has no authenticated player-profile lookup.
     return
