@@ -1,4 +1,5 @@
 import os
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -13,6 +14,14 @@ warnings.filterwarnings(
 )
 
 
+@lru_cache(maxsize=8)
+def _row_indices(length):
+    """Reuse the fixed YOLO row index instead of allocating it every frame."""
+    indices = np.arange(length)
+    indices.flags.writeable = False
+    return indices
+
+
 def _numpy_nms(boxes, scores, iou_threshold=0.6):
     if len(boxes) == 0:
         return np.array([], dtype=np.int32)
@@ -22,7 +31,8 @@ def _numpy_nms(boxes, scores, iou_threshold=0.6):
     x2 = boxes[:, 2]
     y2 = boxes[:, 3]
 
-    areas = (x2 - x1) * (y2 - y1)
+    areas = x2 - x1
+    np.multiply(areas, y2 - y1, out=areas)
     order = scores.argsort()[::-1]
 
     keep = []
@@ -31,19 +41,26 @@ def _numpy_nms(boxes, scores, iou_threshold=0.6):
         i = order[0]
         keep.append(i)
 
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
+        remaining = order[1:]
+        xx1 = np.maximum(x1[i], x1[remaining])
+        yy1 = np.maximum(y1[i], y1[remaining])
+        xx2 = np.minimum(x2[i], x2[remaining])
+        yy2 = np.minimum(y2[i], y2[remaining])
 
-        w = np.maximum(0.0, xx2 - xx1)
-        h = np.maximum(0.0, yy2 - yy1)
+        # Reuse coordinate temporaries for width, height and intersection.
+        # The operation order matches the original IoU expression exactly.
+        np.subtract(xx2, xx1, out=xx2)
+        np.maximum(xx2, 0.0, out=xx2)
+        np.subtract(yy2, yy1, out=yy2)
+        np.maximum(yy2, 0.0, out=yy2)
+        np.multiply(xx2, yy2, out=xx2)
 
-        inter = w * h
-        iou = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
-
-        inds = np.where(iou <= iou_threshold)[0]
-        order = order[inds + 1]
+        union = areas[remaining]
+        np.add(union, areas[i], out=union)
+        np.subtract(union, xx2, out=union)
+        np.add(union, 1e-6, out=union)
+        np.divide(xx2, union, out=xx2)
+        order = remaining[xx2 <= iou_threshold]
 
     return np.array(keep, dtype=np.int32)
 
@@ -98,7 +115,7 @@ def _postprocess_raw(raw_output, conf_tresh=0.6, iou_thresh=0.6,
     class_scores = prediction[:, 4:]
 
     class_ids = np.argmax(class_scores, axis=1)
-    confidences = class_scores[np.arange(n_detections), class_ids]
+    confidences = class_scores[_row_indices(n_detections), class_ids]
 
     mask = confidences >= conf_tresh
 
@@ -109,12 +126,19 @@ def _postprocess_raw(raw_output, conf_tresh=0.6, iou_thresh=0.6,
     confidences = confidences[mask]
     class_ids = class_ids[mask]
 
-    x1 = boxes_cxcywh[:, 0] - boxes_cxcywh[:, 2] / 2
-    y1 = boxes_cxcywh[:, 1] - boxes_cxcywh[:, 3] / 2
-    x2 = boxes_cxcywh[:, 0] + boxes_cxcywh[:, 2] / 2
-    y2 = boxes_cxcywh[:, 1] + boxes_cxcywh[:, 3] / 2
-
-    boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)
+    # Build xyxy directly. This produces the same values as four temporaries
+    # plus np.stack, while avoiding those full-size per-frame arrays.
+    boxes_xyxy = np.empty_like(boxes_cxcywh)
+    half_width = boxes_cxcywh[:, 2] / 2
+    half_height = boxes_cxcywh[:, 3] / 2
+    np.subtract(boxes_cxcywh[:, 0], half_width,
+                out=boxes_xyxy[:, 0])
+    np.subtract(boxes_cxcywh[:, 1], half_height,
+                out=boxes_xyxy[:, 1])
+    np.add(boxes_cxcywh[:, 0], half_width,
+           out=boxes_xyxy[:, 2])
+    np.add(boxes_cxcywh[:, 1], half_height,
+           out=boxes_xyxy[:, 3])
 
     results = []
 
@@ -130,17 +154,12 @@ def _postprocess_raw(raw_output, conf_tresh=0.6, iou_thresh=0.6,
         if len(keep) == 0:
             continue
 
-        kept_boxes = cls_boxes[keep]
-        kept_scores = cls_scores[keep]
-        kept_cls = np.full((len(keep), 1), cls, dtype=np.float32)
-
-        det = np.hstack(
-            [
-                kept_boxes,
-                kept_scores.reshape(-1, 1),
-                kept_cls,
-            ]
-        ).astype(np.float32, copy=False)
+        # Assemble the final rows once instead of creating three intermediate
+        # arrays and concatenating them. Column order and dtype stay identical.
+        det = np.empty((len(keep), 6), dtype=np.float32)
+        det[:, :4] = cls_boxes[keep]
+        det[:, 4] = cls_scores[keep]
+        det[:, 5] = cls
 
         results.append(det)
 
@@ -170,11 +189,57 @@ class Detect:
         self.max_detections_per_class = max(1, int(max_detections_per_class))
         self.model, self.device = self.load_model()
         self.input_name = self.model.get_inputs()[0].name
+        # Postprocessing intentionally consumes only the first model output.
+        # Naming it avoids materializing unused outputs on multi-output exports.
+        self.output_names = [self.model.get_outputs()[0].name]
         self._padded_img_buffer = np.full(
             (1, 3, self.input_size[0], self.input_size[1]),
             128.0 / 255.0,
             dtype=np.float32
         )
+        self._normalization_scale = np.float32(1.0 / 255.0)
+        self._input_feed = {self.input_name: self._padded_img_buffer}
+        self._preprocess_source_shape = None
+        self._preprocess_target = None
+        self._io_binding = None
+        self._output_buffer = None
+        self._configure_static_io_binding()
+
+    def _configure_static_io_binding(self):
+        """Bind static host output once so inference can reuse its allocation."""
+        # DirectML's transfer into a caller-owned CPU buffer is provider- and
+        # driver-sensitive. Keep its established Session.run path; a stale
+        # bound output makes valid frames look as if they contain no entities.
+        if self.device == "DmlExecutionProvider":
+            return
+        output = self.model.get_outputs()[0]
+        shape = tuple(output.shape)
+        if (
+            output.type != "tensor(float)"
+            or not shape
+            or any(not isinstance(size, int) or size <= 0 for size in shape)
+        ):
+            return
+        try:
+            output_buffer = np.empty(shape, dtype=np.float32)
+            io_binding = self.model.io_binding()
+            io_binding.bind_cpu_input(
+                self.input_name, self._padded_img_buffer
+            )
+            io_binding.bind_output(
+                self.output_names[0],
+                device_type="cpu",
+                device_id=0,
+                element_type=np.float32,
+                shape=shape,
+                buffer_ptr=output_buffer.ctypes.data,
+            )
+            self._output_buffer = output_buffer
+            self._io_binding = io_binding
+        except Exception:
+            # Dynamic/older runtimes retain the standard allocation path.
+            self._output_buffer = None
+            self._io_binding = None
 
     def load_model(self):
         available_providers = ort.get_available_providers()
@@ -213,32 +278,52 @@ class Detect:
 
         return model, used_provider
 
+    def _recover_on_cpu(self, error):
+        """Replace a failed GPU session instead of terminating the bot."""
+        if self.device == "CPUExecutionProvider":
+            raise error
+        print(
+            f"{self.device} inference failed; switching this detector to CPU: "
+            f"{error}"
+        )
+        self.preferred_device = "cpu"
+        self.model, self.device = self.load_model()
+        self.input_name = self.model.get_inputs()[0].name
+        self.output_names = [self.model.get_outputs()[0].name]
+        self._input_feed = {self.input_name: self._padded_img_buffer}
+        self._io_binding = None
+        self._output_buffer = None
+
     def preprocess_image(self, img):
         h, w = img.shape[:2]
 
-        scale = min(self.input_size[0] / h, self.input_size[1] / w)
-        new_w = int(w * scale)
-        new_h = int(h * scale)
-
-        shape = (new_h, new_w, 3)
-        if getattr(self, "_resize_shape", None) != shape:
-            self._resize_shape = shape
-            self._resize_buffer = np.empty(shape, dtype=np.uint8)
+        source_shape = (h, w)
+        if self._preprocess_source_shape != source_shape:
+            scale = min(self.input_size[0] / h, self.input_size[1] / w)
+            self._new_w = int(w * scale)
+            self._new_h = int(h * scale)
+            self._preprocess_source_shape = source_shape
+            self._resize_buffer = np.empty(
+                (self._new_h, self._new_w, 3), dtype=np.uint8
+            )
+            self._preprocess_target = self._padded_img_buffer[
+                0, :, :self._new_h, :self._new_w
+            ]
             # A changed aspect ratio must not leave old image pixels in padding.
             self._padded_img_buffer.fill(128.0 / 255.0)
         resized_img = cv2.resize(
             img,
-            (new_w, new_h),
+            (self._new_w, self._new_h),
             dst=self._resize_buffer,
             interpolation=cv2.INTER_LINEAR
         )
 
         np.multiply(
-            resized_img.transpose(2, 0, 1), np.float32(1.0 / 255.0),
-            out=self._padded_img_buffer[0, :, :new_h, :new_w],
+            resized_img.transpose(2, 0, 1), self._normalization_scale,
+            out=self._preprocess_target,
         )
 
-        return self._padded_img_buffer, new_w, new_h
+        return self._padded_img_buffer, self._new_w, self._new_h
 
     def postprocess(self, raw_output, orig_img_shape, resized_shape, conf_tresh=0.6):
         detections = _postprocess_raw(
@@ -262,8 +347,10 @@ class Detect:
                 det[:, 1] *= scale_h
                 det[:, 2] *= scale_w
                 det[:, 3] *= scale_h
-                det[:, [0, 2]] = np.clip(det[:, [0, 2]], 0, orig_w - 1)
-                det[:, [1, 3]] = np.clip(det[:, [1, 3]], 0, orig_h - 1)
+                np.clip(det[:, 0], 0, orig_w - 1, out=det[:, 0])
+                np.clip(det[:, 2], 0, orig_w - 1, out=det[:, 2])
+                np.clip(det[:, 1], 0, orig_h - 1, out=det[:, 1])
+                np.clip(det[:, 3], 0, orig_h - 1, out=det[:, 3])
                 results.append(det)
 
         return results
@@ -271,12 +358,35 @@ class Detect:
     def detect_objects(self, img, conf_tresh=0.6):
         orig_h, orig_w = img.shape[:2]
 
-        preprocessed_img, resized_w, resized_h = self.preprocess_image(img)
+        _, resized_w, resized_h = self.preprocess_image(img)
 
-        outputs = self.model.run(
-            None,
-            {self.input_name: preprocessed_img}
-        )
+        if self._io_binding is not None:
+            try:
+                self.model.run_with_iobinding(self._io_binding)
+                # DirectML may complete a pre-bound CPU output transfer
+                # asynchronously. Do not let NumPy postprocessing observe the
+                # previous/unfinished buffer contents.
+                self._io_binding.synchronize_outputs()
+                outputs = (self._output_buffer,)
+            except Exception as error:
+                # Disable a binding permanently after a runtime/provider
+                # rejection and complete this frame through the proven path.
+                print(f"Reusable ONNX output disabled: {error}")
+                self._io_binding = None
+                self._output_buffer = None
+                outputs = self.model.run(
+                    self.output_names, self._input_feed
+                )
+        else:
+            try:
+                outputs = self.model.run(
+                    self.output_names, self._input_feed
+                )
+            except Exception as error:
+                self._recover_on_cpu(error)
+                outputs = self.model.run(
+                    self.output_names, self._input_feed
+                )
 
         detections = self.postprocess(
             outputs,
@@ -286,30 +396,37 @@ class Detect:
         )
 
         results = {}
+        classes = self.classes
+        ignore_classes = self.ignore_classes
+        get_result = results.get
 
         for detection in detections:
-            coordinates = detection[:, :4].astype(np.int32, copy=False)
-            class_ids = detection[:, 5].astype(np.int32, copy=False)
-            for box, class_id in zip(coordinates, class_ids):
-
-                if self.classes is None:
-                    class_name = str(class_id)
-                else:
-                    if class_id < 0 or class_id >= len(self.classes):
-                        print(
-                            f"WARNING: class_id {class_id} is out of range "
-                            f"(classes length: {len(self.classes)}). Detection ignored."
-                        )
-                        continue
-
-                    class_name = self.classes[class_id]
-
-                if class_id in self.ignore_classes or class_name in self.ignore_classes:
+            if not len(detection):
+                continue
+            coordinates = detection[:, :4].astype(
+                np.int32, copy=False
+            ).tolist()
+            # Each postprocess block was created from exactly one class, so
+            # resolve and filter it once instead of once per detected box.
+            class_id = int(detection[0, 5])
+            if classes is None:
+                class_name = str(class_id)
+            else:
+                if class_id < 0 or class_id >= len(classes):
+                    print(
+                        f"WARNING: class_id {class_id} is out of range "
+                        f"(classes length: {len(classes)}). Detection ignored."
+                    )
                     continue
+                class_name = classes[class_id]
 
-                if class_name not in results:
-                    results[class_name] = []
+            if class_id in ignore_classes or class_name in ignore_classes:
+                continue
 
-                results[class_name].append(box.tolist())
+            class_results = get_result(class_name)
+            if class_results is None:
+                results[class_name] = coordinates
+            else:
+                class_results.extend(coordinates)
 
         return results

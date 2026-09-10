@@ -1,6 +1,7 @@
 import os
 import sys
 import cv2
+import numpy as np
 import time
 import threading
 import weakref
@@ -37,16 +38,62 @@ STATE_FINDER_DEBUG = config_bool(
 _match_cache = threading.local()
 
 
-def _template_score(frame, crop, template, key):
+@lru_cache(maxsize=128)
+def _scaled_region(current_width, current_height, region):
+    orig_x, orig_y, orig_width, orig_height = region
+    width_ratio = current_width / orig_screen_width
+    height_ratio = current_height / orig_screen_height
+    return (
+        int(orig_x * width_ratio), int(orig_y * height_ratio),
+        int(orig_width * width_ratio), int(orig_height * height_ratio),
+    )
+
+
+def _match_result_buffer(height, width):
+    """Return a reusable per-thread OpenCV template-score matrix."""
+    buffers = getattr(_match_cache, 'result_buffers', None)
+    if buffers is None:
+        buffers = {}
+        _match_cache.result_buffers = buffers
+    key = (height, width)
+    result = buffers.get(key)
+    if result is None:
+        result = np.empty(key, dtype=np.float32)
+        buffers[key] = result
+    return result
+
+
+def _prepare_frame_cache(frame):
     frame_ref = getattr(_match_cache, 'frame_ref', None)
     cached_frame = frame_ref() if frame_ref is not None else None
     if cached_frame is not frame:
         _match_cache.frame_ref = weakref.ref(frame)
+        _match_cache.crops = {}
         _match_cache.scores = {}
+
+
+def _frame_crop(frame, key, x, y, width, height):
+    """Reuse an exact region view across templates evaluated on one frame."""
+    _prepare_frame_cache(frame)
+    crops = _match_cache.crops
+    crop = crops.get(key)
+    if crop is None:
+        crop = frame[y:y + height, x:x + width]
+        crops[key] = crop
+    return crop
+
+
+def _template_score(frame, crop, template, key):
+    _prepare_frame_cache(frame)
     cache = _match_cache.scores
     if key in cache:
         return cache[key]
-    result = cv2.matchTemplate(crop, template, cv2.TM_CCOEFF_NORMED)
+    result_height = crop.shape[0] - template.shape[0] + 1
+    result_width = crop.shape[1] - template.shape[1] + 1
+    result = cv2.matchTemplate(
+        crop, template, cv2.TM_CCOEFF_NORMED,
+        result=_match_result_buffer(result_height, result_width),
+    )
     score = cv2.minMaxLoc(result)[1]
     cache[key] = score
     return score
@@ -56,12 +103,15 @@ def is_template_in_region(image, template_path, region, threshold=None):
     if threshold is None:
         threshold = STATE_DETECTION_CONFIDENCE
     current_height, current_width = image.shape[:2]
-    orig_x, orig_y, orig_width, orig_height = region
-    width_ratio, height_ratio = current_width / orig_screen_width, current_height / orig_screen_height
-
-    new_x, new_y = int(orig_x * width_ratio), int(orig_y * height_ratio)
-    new_width, new_height = int(orig_width * width_ratio), int(orig_height * height_ratio)
-    cropped_image = image[new_y:new_y + new_height, new_x:new_x + new_width]
+    region_key = tuple(region)
+    new_x, new_y, new_width, new_height = _scaled_region(
+        current_width, current_height, region_key
+    )
+    cropped_image = _frame_crop(
+        image,
+        (current_width, current_height, region_key),
+        new_x, new_y, new_width, new_height,
+    )
     loaded_template = load_template(template_path, current_width, current_height)
     if loaded_template is None or cropped_image.size == 0:
         return False
@@ -74,7 +124,7 @@ def is_template_in_region(image, template_path, region, threshold=None):
     try:
         max_val = _template_score(
             image, cropped_image, loaded_template,
-            (template_path, current_width, current_height, tuple(region))
+            (template_path, current_width, current_height, region_key)
         )
     except cv2.error as e:
         if should_print_debug_info:
@@ -205,7 +255,59 @@ def is_in_match_making(image):
 
 
 def is_in_prestige_milestone(image):
-    return is_template_in_region(image, states_path + "prestige_continue.png", region_data['prestige_continue'])
+    return (
+        is_template_in_region(
+            image, states_path + "prestige_continue.png",
+            region_data['prestige_continue']
+        )
+        or find_lower_right_green_action(image) is not None
+    )
+
+
+def find_lower_right_green_action(image):
+    """Locate wide green post-match action buttons such as LET'S GO."""
+    height, width = image.shape[:2]
+    # Matchmaking and gameplay contain many green regions. A prestige action
+    # is a large, bright, horizontal button in the extreme lower-right; do
+    # not classify arbitrary green terrain/UI as a modal state.
+    x1, y1 = int(width * 0.66), int(height * 0.76)
+    crop = image[y1:height, x1:width]
+    if crop.size == 0:
+        return None
+    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
+    mask = cv2.inRange(
+        hsv,
+        np.array((38, 125, 145), dtype=np.uint8),
+        np.array((95, 255, 255), dtype=np.uint8),
+    )
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    candidates = []
+    minimum_area = width * height * 0.0015
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < minimum_area:
+            continue
+        local_x, local_y, button_width, button_height = cv2.boundingRect(contour)
+        if button_height < height * 0.035 or button_width < width * 0.12:
+            continue
+        if button_width / max(button_height, 1) < 1.8:
+            continue
+        if local_x + button_width * 0.5 < (width - x1) * 0.18:
+            continue
+        fill_ratio = area / max(button_width * button_height, 1)
+        if fill_ratio < 0.48:
+            continue
+        candidates.append((
+            area,
+            x1 + local_x + button_width * 0.5,
+            y1 + local_y + button_height * 0.5,
+        ))
+    if not candidates:
+        return None
+    _, center_x, center_y = max(candidates, key=lambda item: item[0])
+    return int(center_x), int(center_y)
 
 
 def is_in_star_drop(image):
@@ -227,14 +329,39 @@ def get_state(screenshot, previous_state=None):
     # caller still requests periodic full scans for unexpected transitions.
     if previous_state == "match":
         game_result = is_in_end_of_a_match(screenshot)
-        state = f"end_{game_result}" if game_result else "match"
+        if game_result:
+            state = f"end_{game_result}"
+        elif is_in_lobby(screenshot):
+            # Check lobby before generic green reward buttons: lobby Play is
+            # also green and occupies the lower-right part of the screen.
+            state = "lobby"
+        elif is_in_prestige_milestone(screenshot):
+            state = "prestige_milestone"
+        elif is_in_trophy_reward(screenshot):
+            state = "trophy_reward"
+        else:
+            star_drop_type = is_in_star_drop(screenshot)
+            state = (
+                f"star_drop_{star_drop_type}"
+                if star_drop_type else "match"
+            )
     elif previous_state == "lobby" and is_in_lobby(screenshot):
         state = "lobby"
     elif previous_state == "match_making" and is_in_match_making(screenshot):
         state = "match_making"
+    elif previous_state == "match_making":
+        # Prestige/reward overlays cannot legitimately appear while the
+        # matchmaking screen is still the established state. If the exit
+        # template vanished, let the entity probe establish the match or let
+        # the next full scan identify the actual post-match menu.
+        state = "lobby" if is_in_lobby(screenshot) else "match"
     elif previous_state == "brawler_selection" and is_in_brawler_selection(screenshot):
         state = "brawler_selection"
     else:
         state = get_in_game_state(screenshot)
-    if config_bool(load_toml_as_dict("cfg/debug_settings.toml").get('state_finder_debug'), False): cv2.imwrite(f"./debug_frames/state_screenshot_{state}_{len(os.listdir('./debug_frames'))}.png", cv2.cvtColor(screenshot, cv2.COLOR_BGR2RGB))
+    if STATE_FINDER_DEBUG:
+        cv2.imwrite(
+            f"./debug_frames/state_screenshot_{state}_{len(os.listdir('./debug_frames'))}.png",
+            cv2.cvtColor(screenshot, cv2.COLOR_BGR2RGB),
+        )
     return state

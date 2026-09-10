@@ -116,7 +116,7 @@ class TrophyObserver:
         save_dict_as_toml({"trophies": self.trophy_ledger}, self.trophy_ledger_file)
 
     def select_brawler(self, brawler, fallback_trophies):
-        """Restore the last bot-confirmed total for this brawler."""
+        """Use the queue/API total until fresh lobby OCR confirms a new one."""
         key = str(brawler).lower().strip()
         try:
             fallback = max(0, int(fallback_trophies))
@@ -124,12 +124,15 @@ class TrophyObserver:
             fallback = 0
         self.current_brawler = key
         confirmed = self.trophy_ledger.get(key)
-        self.current_trophies = fallback if confirmed is None else confirmed
-        if confirmed is None:
+        self.current_trophies = fallback
+        if confirmed != fallback:
+            if confirmed is not None:
+                print(
+                    f"Refreshing stale trophy ledger for {brawler}: "
+                    f"{confirmed} -> {fallback}"
+                )
             self.trophy_ledger[key] = fallback
             self._save_trophy_ledger()
-        elif confirmed != fallback:
-            print(f"Using confirmed trophy count for {brawler}: {confirmed} (queue had {fallback})")
         return self.current_trophies
 
     def _remember_current_trophies(self, brawler=None):
@@ -286,7 +289,9 @@ class TrophyObserver:
                 raw_string=raw_result
             )
 
-    def add_trophies(self, parsed_result: ParsedGameResult, current_brawler, playstyle_info, underdog, power_level=None):
+    def add_trophies(self, parsed_result: ParsedGameResult, current_brawler,
+                     playstyle_info, underdog, power_level=None,
+                     observed_trophies=None, calculate_when_missing=True):
         if self.current_trophies is None:
             self.current_trophies = 0
         old_trophies = self.current_trophies
@@ -294,34 +299,54 @@ class TrophyObserver:
             underdog = False
         old_win_streak = self.win_streak
 
+        calculated_delta = None
         if parsed_result.result == MatchResult.VICTORY:
             self.win_streak += 1
-            if parsed_result.place is not None:
-                trophy_delta = self.calc_showdown_delta(parsed_result.place)
-            else:
-                trophy_delta = self.calc_win_increment(underdog)
+            if calculate_when_missing:
+                if parsed_result.place is not None:
+                    calculated_delta = self.calc_showdown_delta(parsed_result.place)
+                else:
+                    calculated_delta = self.calc_win_increment(underdog)
         elif parsed_result.result == MatchResult.DEFEAT:
             if not underdog:
                 self.win_streak = 0
-            if parsed_result.place is not None:
-                trophy_delta = self.calc_showdown_delta(parsed_result.place)
-            else:
-                trophy_delta = -self.calc_lost_decrement(underdog)
+            if calculate_when_missing:
+                if parsed_result.place is not None:
+                    calculated_delta = self.calc_showdown_delta(parsed_result.place)
+                else:
+                    calculated_delta = -self.calc_lost_decrement(underdog)
         elif parsed_result.result == MatchResult.DRAW:
-            if parsed_result.place is not None:
-                trophy_delta = self.calc_showdown_delta(parsed_result.place)
-            else:
-                print("Nothing changed. Draw detected")
-                trophy_delta = self.calc_draw_increment(underdog)
+            if calculate_when_missing:
+                if parsed_result.place is not None:
+                    calculated_delta = self.calc_showdown_delta(parsed_result.place)
+                else:
+                    print("Nothing changed. Draw detected")
+                    calculated_delta = self.calc_draw_increment(underdog)
         else:
             print("Catastrophic failure")
-            trophy_delta = 0
-        if self.current_trophies >= 1000 and self.current_trophies + trophy_delta < 1000:
+            calculated_delta = 0 if calculate_when_missing else None
+
+        if observed_trophies is not None:
+            self.current_trophies = max(0, int(observed_trophies))
+            trophy_delta = self.current_trophies - old_trophies
+            print(f"Read trophy total from screen: {self.current_trophies}")
+        elif calculated_delta is None:
+            # An unknown screen value is safer than silently drifting the
+            # persistent total with a rules-table estimate.
+            trophy_delta = ""
+            print(
+                "Trophy total is waiting for lobby OCR; keeping the previous "
+                "total temporarily."
+            )
+        elif self.current_trophies >= 1000 and self.current_trophies + calculated_delta < 1000:
             self.current_trophies = 1000
-        elif self.current_trophies >= 2000 and self.current_trophies + trophy_delta < 2000:
+            trophy_delta = self.current_trophies - old_trophies
+        elif self.current_trophies >= 2000 and self.current_trophies + calculated_delta < 2000:
             self.current_trophies = 2000
+            trophy_delta = self.current_trophies - old_trophies
         else:
-            self.current_trophies += trophy_delta
+            self.current_trophies += calculated_delta
+            trophy_delta = calculated_delta
 
         print(f"Trophies: {old_trophies} -> {self.current_trophies}")
         print(f"Win Streak: {old_win_streak} -> {self.win_streak}")

@@ -370,7 +370,15 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                 try:
                     scan_now = time.monotonic()
                     previous_state = self.get_latest_state()
-                    if scan_now - self.last_full_state_scan >= self.full_state_scan_interval:
+                    # During a live match the only normal visual transition is
+                    # an end screen, which the match-specific path already
+                    # checks. Full menu scans here competed with entity
+                    # inference for CPU every two seconds on low-end systems.
+                    if (
+                        previous_state != "match"
+                        and scan_now - self.last_full_state_scan
+                            >= self.full_state_scan_interval
+                    ):
                         previous_state = None
                         self.last_full_state_scan = scan_now
                     self.observe_state(
@@ -499,6 +507,11 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                             continue
                         self.picked_first_brawler = True
                         self.update_trophy_observer()
+                        # Selection has its own synchronization point.  Do not
+                        # rely on a later lobby action: the fast Play handler
+                        # may otherwise leave before the selected brawler's
+                        # trophy panel has rendered.
+                        self.Stage_manager.sync_selected_brawler_trophies()
                     else:
                         self.picked_first_brawler = True
                 t_now = time.time()
@@ -619,7 +632,15 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                         f"A* cache hits={path_saved:.1f}%, "
                         f"A* nodes={planner.expanded_nodes}, "
                         f"path waypoint reduction={waypoint_reduction:.1f}%, "
-                        f"routes={planner.routes_found}/{planner.routes_failed}"
+                        f"routes={planner.routes_found}/{planner.routes_failed}, "
+                        f"detour reversals blocked={self.Play.detour_reversals_prevented}, "
+                        f"stale moves overridden={self.Play.stale_movement_overrides}, "
+                        f"opposite goals overridden={self.Play.opposite_goal_overrides}, "
+                        f"collision corrections/stops={self.Play.collision_corrections}/{self.Play.collision_stops}, "
+                        f"stale wall stops={self.Play.stale_wall_stops}, "
+                        f"unsafe attacks/supers blocked="
+                        f"{self.Play.unsafe_attack_requests_blocked}/"
+                        f"{self.Play.unsafe_super_requests_blocked}"
                     )
                     self.last_performance_report = inference_now
 

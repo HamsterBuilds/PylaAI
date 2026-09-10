@@ -14,7 +14,7 @@ from state_finder import get_state
 from perception import DetectionStabilizer, SceneChangeGate
 from pathfinding import LocalPathPlanner
 from utils import load_toml_as_dict, count_hsv_pixels, load_brawlers_info, interpret_pyla_code, \
-    count_mask_pixels, JOYSTICK_RADIUS, clamp, config_bool, is_safe_ast, SAFE_GLOBALS
+    JOYSTICK_RADIUS, clamp, config_bool, is_safe_ast, SAFE_GLOBALS
 
 
 brawl_stars_width, brawl_stars_height = 1920, 1080
@@ -36,6 +36,8 @@ class Play:
         self.walls_treshold = time_config["wall_detection"]
         self.last_walls_data = []
         self.last_bushes_data = []
+        self._wall_tracks = []
+        self._wall_navigation_ready = False
         self.keys_hold = []
         self.time_since_gadget_checked = time.time()
         self.is_gadget_ready = False
@@ -105,12 +107,24 @@ class Play:
             1.0, max(0.35, float(bot_config.get("ability_detection_scale", 0.5)))
         )
         self.wall_detection_confidence = bot_config["wall_detection_confidence"]
+        self.wall_navigation_maximum_age = max(
+            0.7, float(bot_config.get("wall_navigation_maximum_age", 1.2))
+        )
+        self.navigation_wall_padding = max(
+            0.0, float(bot_config.get("navigation_wall_padding", 6.0))
+        )
         self.entity_detection_confidence = bot_config["entity_detection_confidence"]
         self.seconds_to_hold_attack_after_reaching_max = bot_config["seconds_to_hold_attack_after_reaching_max"]
         self.minimum_attack_interval = max(
             0.0, float(bot_config.get("minimum_attack_interval", 0.08))
         )
+        self.line_of_sight_wall_padding = max(
+            4.0, float(bot_config.get("line_of_sight_wall_padding", 12.0))
+        )
         self.last_attack_at = 0.0
+        self._attack_authorized_until = 0.0
+        self._super_authorized_until = 0.0
+        self._current_enemy_data = ()
         self.persistent_data = {"time_since_holding_attack": None}
         self._playstyle_globals = None
         if isinstance(pyla_code, str):
@@ -145,7 +159,7 @@ class Play:
         else:
             self.pyla_code = pyla_code
         self.context = None
-        self._dynamic_context = None
+        self._dynamic_context = {}
         self._playstyle_context_initialized = False
         self._playstyle_api_callables = None
         self._last_playstyle_error = None
@@ -153,7 +167,9 @@ class Play:
         self.frame = None
         self._ability_crop_cache = {}
         self._ability_crop_scale = None
+        self._ability_processing_buffers = {}
         self._decision_cache = {}
+        self._wall_penetration_cache = {}
         self._prepared_frame_ref = None
         self._prepared_main_data = None
         self._target_memory = {}
@@ -174,6 +190,8 @@ class Play:
             0.25, float(bot_config.get("objective_arrival_tiles", 0.65))
         )
         self.last_teammate_position = None
+        self.last_teammate_direction = None
+        self.last_teammate_distance = 0.0
         self.last_teammate_seen_at = 0.0
         self.teammate_memory_duration = max(
             0.5, float(bot_config.get("teammate_memory_duration", 3.0))
@@ -192,16 +210,40 @@ class Play:
         self._detour_heading = None
         self._detour_goal_heading = None
         self._detour_expires_at = 0.0
+        self._direct_clear_since = 0.0
+        self._exploration_heading = (0.0, -JOYSTICK_RADIUS)
+        self._exploration_expires_at = 0.0
+        self._exploration_index = 0
+        self._obstacle_progress_center = None
+        self._obstacle_progress_at = 0.0
+        self._obstacle_escape_side = 1
+        self._obstacle_stuck_count = 0
         self.poison_cache_interval = max(
             0.05, float(bot_config.get("poison_detection_interval", 0.2))
         )
         self._poison_cache = None
         self._poison_cache_at = 0.0
         self._poison_cache_player = None
+        self._poison_buffer_shape = None
+        self._poison_hsv_buffer = None
+        self._poison_mask_buffer = None
+        self._poison_filtered_mask_buffer = None
+        self._latest_poison_gas = {
+            "up": 0, "down": 0, "left": 0, "right": 0,
+        }
+        self._poison_danger_regions = ()
         self.wall_inference_count = 0
         self.wall_cache_count = 0
         self.poison_compute_count = 0
         self.poison_cache_count = 0
+        self.detour_reversals_prevented = 0
+        self.stale_movement_overrides = 0
+        self.opposite_goal_overrides = 0
+        self.collision_corrections = 0
+        self.collision_stops = 0
+        self.stale_wall_stops = 0
+        self.unsafe_attack_requests_blocked = 0
+        self.unsafe_super_requests_blocked = 0
 
     @staticmethod
     def get_entity_pos(entity):
@@ -218,10 +260,15 @@ class Play:
         return True
 
     def attack(self, touch_up=True, touch_down=True):
+        now = time.monotonic()
+        if touch_down and now > self._attack_authorized_until:
+            # Starting a shot requires a current line-of-sight confirmation.
+            # A touch-up is still allowed so charged attacks cannot stick.
+            self.unsafe_attack_requests_blocked += 1
+            return False
         # Rate-limit only complete taps. Charge start and release are edge
         # events and must always reach the device immediately.
         if touch_up and touch_down:
-            now = time.monotonic()
             if now - self.last_attack_at < self.minimum_attack_interval:
                 return False
             self.last_attack_at = now
@@ -243,11 +290,15 @@ class Play:
         self.is_gadget_ready = False
 
     def use_super(self):
+        if time.monotonic() > self._super_authorized_until:
+            self.unsafe_super_requests_blocked += 1
+            return False
         print("Using super")
         self.window_controller.press("super")
         self.time_since_super_checked = time.time()
         self._ability_used_at["super"] = time.monotonic()
         self.is_super_ready = False
+        return True
 
     def ability_can_recheck(self, name):
         return time.monotonic() - self._ability_used_at[name] >= self.ability_rearm_delay
@@ -277,6 +328,42 @@ class Play:
     def get_random_movement():
         random_movement = random.randint(-75, 75), random.randint(-75, 75)
         return random_movement
+
+    def get_exploration_movement(self, player_box, walls):
+        """Head toward the friendly-spawn-to-map-centre direction."""
+        danger_up, danger_down, danger_left, danger_right = (
+            self._directional_poison_danger()
+        )
+        # Gas closes from the map edge, so its opposite direction is direct
+        # evidence of where the map centre lies. Retain that evidence after
+        # the local gas pixels leave the scan instead of resuming a patrol.
+        inferred_x = danger_left - danger_right
+        inferred_y = danger_up - danger_down
+        if math.hypot(inferred_x, inferred_y) >= 0.05:
+            centre_heading = self.normalize_move(inferred_x, inferred_y)
+            previous = self._exploration_heading
+            if math.hypot(*previous) >= 1:
+                centre_heading = self.normalize_move(
+                    previous[0] * 0.35 + centre_heading[0] * 0.65,
+                    previous[1] * 0.35 + centre_heading[1] * 0.65,
+                )
+            self._exploration_heading = centre_heading
+        else:
+            centre_heading = self._exploration_heading
+        if self._movement_poison_risk(centre_heading) >= 0.08:
+            headings = (
+                centre_heading,
+                (0.0, -JOYSTICK_RADIUS),
+                (JOYSTICK_RADIUS, 0.0),
+                (0.0, JOYSTICK_RADIUS),
+                (-JOYSTICK_RADIUS, 0.0),
+            )
+            centre_heading = min(headings, key=self._movement_poison_risk)
+        # Do not rotate merely because a wall is ahead. The central A*
+        # navigator owns that decision and will preserve the map-centre goal
+        # while routing around the obstacle.
+        self._exploration_heading = centre_heading
+        return centre_heading
 
     @staticmethod
     def movement_to_vector(movement):
@@ -336,14 +423,57 @@ class Play:
         dx, dy = end[0] - x1, end[1] - y1
         left, top, right, bottom = rect
         enter, leave = 0.0, 1.0
-        for p, q in (
-            (-dx, x1 - left), (dx, right - x1),
-            (-dy, y1 - top), (dy, bottom - y1),
-        ):
-            if abs(p) < 1e-9:
-                if q < 0:
+
+        p, q = -dx, x1 - left
+        if abs(p) < 1e-9:
+            if q < 0:
+                return False
+        else:
+            ratio = q / p
+            if p < 0:
+                if ratio > leave:
                     return False
-                continue
+                enter = max(enter, ratio)
+            else:
+                if ratio < enter:
+                    return False
+                leave = min(leave, ratio)
+
+        p, q = dx, right - x1
+        if abs(p) < 1e-9:
+            if q < 0:
+                return False
+        else:
+            ratio = q / p
+            if p < 0:
+                if ratio > leave:
+                    return False
+                enter = max(enter, ratio)
+            else:
+                if ratio < enter:
+                    return False
+                leave = min(leave, ratio)
+
+        p, q = -dy, y1 - top
+        if abs(p) < 1e-9:
+            if q < 0:
+                return False
+        else:
+            ratio = q / p
+            if p < 0:
+                if ratio > leave:
+                    return False
+                enter = max(enter, ratio)
+            else:
+                if ratio < enter:
+                    return False
+                leave = min(leave, ratio)
+
+        p, q = dy, bottom - y1
+        if abs(p) < 1e-9:
+            if q < 0:
+                return False
+        else:
             ratio = q / p
             if p < 0:
                 if ratio > leave:
@@ -356,14 +486,20 @@ class Play:
         return enter <= leave
 
     @staticmethod
-    def walls_block_line_of_sight(p1, p2, walls):
+    def walls_block_line_of_sight(p1, p2, walls, padding=0.0):
         if not walls:
             return False
 
         min_x, max_x = min(p1[0], p2[0]), max(p1[0], p2[0])
         min_y, max_y = min(p1[1], p2[1]), max(p1[1], p2[1])
         for wall in walls:
-            x1, y1, x2, y2 = wall
+            x1, y1, x2, y2 = wall[:4]
+
+            if padding:
+                x1 -= padding
+                y1 -= padding
+                x2 += padding
+                y2 += padding
 
             if max_x < x1 or min_x > x2 or max_y < y1 or min_y > y2:
                 continue
@@ -410,8 +546,8 @@ class Play:
         radius_sq = radius * radius
 
         for wall in walls:
-            x1, y1, x2, y2 = wall[:4]
-            wall_rect = (x1, y1, x2, y2)
+            wall_rect = wall[:4]
+            x1, y1, x2, y2 = wall_rect
             expanded_x1 = x1 - radius
             expanded_y1 = y1 - radius
             expanded_x2 = x2 + radius
@@ -424,24 +560,122 @@ class Play:
                 p1, p2, (expanded_x1, expanded_y1, expanded_x2, expanded_y2)
             ):
                 start_distance_sq = Play.point_rect_distance_sq(p1, wall_rect)
-                end_distance_sq = Play.point_rect_distance_sq(p2, wall_rect)
-                if start_distance_sq <= radius_sq and end_distance_sq > start_distance_sq:
-                    continue
+                if start_distance_sq <= radius_sq:
+                    nearest_x = clamp(p1[0], x1, x2)
+                    nearest_y = clamp(p1[1], y1, y2)
+                    outward_x = p1[0] - nearest_x
+                    outward_y = p1[1] - nearest_y
+                    if abs(outward_x) + abs(outward_y) < 1e-6:
+                        # Overlapping detector boxes can place the estimated
+                        # player centre inside terrain. Choose its nearest edge
+                        # as the deterministic escape direction.
+                        edge = min(
+                            (
+                                (p1[0] - x1, -1.0, 0.0),
+                                (x2 - p1[0], 1.0, 0.0),
+                                (p1[1] - y1, 0.0, -1.0),
+                                (y2 - p1[1], 0.0, 1.0),
+                            ),
+                            key=lambda item: item[0],
+                        )
+                        outward_x, outward_y = edge[1], edge[2]
+                    movement_x = p2[0] - p1[0]
+                    movement_y = p2[1] - p1[1]
+                    # Positive is away, zero is tangent, negative enters the
+                    # obstacle. End-distance alone misclassified tangents and
+                    # could also approve a long segment crossing the wall.
+                    if (
+                        movement_x * outward_x + movement_y * outward_y
+                        >= -1e-6
+                    ):
+                        continue
                 return True
 
         return False
 
     def is_enemy_hittable(self, player_pos, enemy_pos, walls, skill_type):
+        player_key = tuple(player_pos)
+        enemy_key = tuple(enemy_pos)
         cache_key = (
             "line_of_sight", skill_type, self.current_brawler,
-            tuple(player_pos), tuple(enemy_pos), id(walls),
+            player_key, enemy_key, id(walls),
         )
         if cache_key in self._decision_cache:
             return self._decision_cache[cache_key]
-        if self.can_attack_through_walls(self.current_brawler, skill_type, self.brawlers_info):
+        penetration_key = (self.current_brawler, skill_type)
+        can_ignore_walls = self._wall_penetration_cache.get(penetration_key)
+        if can_ignore_walls is None:
+            can_ignore_walls = self.can_attack_through_walls(
+                self.current_brawler, skill_type, self.brawlers_info
+            )
+            self._wall_penetration_cache[penetration_key] = can_ignore_walls
+        if can_ignore_walls:
             result = True
+        elif not self._wall_navigation_ready:
+            # An empty wall list before the first tile inference means
+            # "unknown", not "clear line of sight".
+            result = False
+        elif time.time() - self.time_since_walls_checked > 0.70:
+            # Wall boxes are screen-space coordinates. Once the camera moves,
+            # an old box is not safe evidence for an auto-aim shot.
+            result = False
         else:
-            result = not self.walls_block_line_of_sight(player_pos, enemy_pos, walls)
+            # Attack and super can have different wall-penetration rules, but
+            # when either needs geometry the underlying segment/wall result is
+            # identical. Share that potentially long wall scan within a frame.
+            geometry_key = (
+                "wall_line", player_key, enemy_key, id(walls)
+            )
+            blocked = self._decision_cache.get(geometry_key)
+            if blocked is None:
+                blocked = self.walls_block_line_of_sight(
+                    player_pos, enemy_pos, walls,
+                    padding=(
+                        self.line_of_sight_wall_padding
+                        * self.window_controller.scale_factor
+                    ),
+                )
+                self._decision_cache[geometry_key] = blocked
+            result = not blocked
+        if skill_type in ("attack", "super") and result:
+            # The attack button auto-aims at the nearest enemy, which may not
+            # be the visible target selected by the playstyle. Do not approve
+            # the tap when a closer enemy is hidden behind terrain.
+            autoaim_is_safe = True
+            if not can_ignore_walls:
+                # Brawl Stars auto-aim chooses the nearest detected enemy,
+                # not necessarily the visible target selected by a playstyle.
+                # Validate that exact target. The old '< target distance'
+                # loop missed equal-distance enemies and could consequently
+                # authorize a shot which auto-aim sent into terrain.
+                autoaim_pos = enemy_pos
+                if self._current_enemy_data:
+                    autoaim_pos = min(
+                        (
+                            self.get_entity_pos(candidate)
+                            for candidate in self._current_enemy_data
+                        ),
+                        key=lambda position: self.get_distance(
+                            player_pos, position
+                        ),
+                    )
+                autoaim_is_safe = not self.walls_block_line_of_sight(
+                    player_pos, autoaim_pos, walls,
+                    padding=(
+                        self.line_of_sight_wall_padding
+                        * self.window_controller.scale_factor
+                    ),
+                )
+            if autoaim_is_safe:
+                authorized_until = time.monotonic() + 0.20
+                if skill_type == "attack":
+                    self._attack_authorized_until = authorized_until
+                else:
+                    self._super_authorized_until = authorized_until
+            else:
+                # "Hittable" describes the result of pressing auto-aim, not
+                # merely whether one candidate has a clear centre ray.
+                result = False
         self._decision_cache[cache_key] = result
         return result
 
@@ -461,9 +695,10 @@ class Play:
         margin = radius + 6.0 * (self.window_controller.scale_factor or 1)
         extra = 0.0
         for wall in walls:
-            if not self.segment_intersects_rect(start, goal, wall[:4]):
+            wall_rect = wall[:4]
+            if not self.segment_intersects_rect(start, goal, wall_rect):
                 continue
-            x1, y1, x2, y2 = wall[:4]
+            x1, y1, x2, y2 = wall_rect
             corners = (
                 (x1 - margin, y1 - margin), (x2 + margin, y1 - margin),
                 (x1 - margin, y2 + margin), (x2 + margin, y2 + margin),
@@ -478,13 +713,13 @@ class Play:
         return result
 
     def find_closest_enemy(self, enemy_data, player_coords, walls, skill_type):
+        player_key = tuple(player_coords)
         cache_key = (
-            "enemy", id(enemy_data), id(walls), tuple(player_coords),
+            "enemy", id(enemy_data), id(walls), player_key,
             skill_type, self.current_brawler,
         )
         if cache_key in self._decision_cache:
             return self._decision_cache[cache_key]
-        player_pos_x, player_pos_y = player_coords
         closest_hittable_distance = float('inf')
         closest_hittable = None
         fastest_unhittable = None
@@ -517,7 +752,9 @@ class Play:
                 and not can_match_previous
             ):
                 continue
-            if self.is_enemy_hittable((player_pos_x, player_pos_y), enemy_pos, walls, skill_type):
+            if self.is_enemy_hittable(
+                player_key, enemy_pos, walls, skill_type
+            ):
                 if distance < closest_hittable_distance:
                     closest_hittable_distance = distance
                     closest_hittable = [enemy_pos, distance]
@@ -526,7 +763,7 @@ class Play:
                     matching_hittable = [enemy_pos, distance]
             else:
                 navigation_cost = self.estimate_navigation_cost(
-                    player_coords, enemy_pos, walls
+                    player_key, enemy_pos, walls
                 )
                 if navigation_cost < fastest_unhittable_cost:
                     fastest_unhittable_cost = navigation_cost
@@ -550,7 +787,7 @@ class Play:
             result = fastest_unhittable
             if matching_unhittable is not None:
                 matching_cost = self.estimate_navigation_cost(
-                    player_coords, matching_unhittable[0], walls
+                    player_key, matching_unhittable[0], walls
                 )
                 if matching_cost <= fastest_unhittable_cost * self.target_switch_ratio:
                     result = matching_unhittable
@@ -565,17 +802,74 @@ class Play:
         cache_key = ("teammate", id(teammate_data), tuple(player_coords))
         if cache_key in self._decision_cache:
             return self._decision_cache[cache_key]
-        teammate_anchor = self.get_teammate_anchor(teammate_data)
-        if teammate_anchor is not None:
-            teammate_distance = self.get_distance(teammate_anchor, player_coords)
+        teammate_anchor = None
+        teammate_distance = float('inf')
+        if teammate_data:
+            positions = [
+                self.get_entity_pos(teammate) for teammate in teammate_data
+            ]
+            closest = min(
+                positions,
+                key=lambda position: self.get_distance(
+                    position, player_coords
+                ),
+            )
+            closest_distance = self.get_distance(closest, player_coords)
+            teammate_anchor = closest
+            teammate_distance = closest_distance
+            if self.last_teammate_position is not None:
+                matching = min(
+                    positions,
+                    key=lambda position: self.get_distance(
+                        position, self.last_teammate_position
+                    ),
+                )
+                match_delta = self.get_distance(
+                    matching, self.last_teammate_position
+                )
+                matching_distance = self.get_distance(
+                    matching, player_coords
+                )
+                match_limit = self.target_match_distance * (
+                    self.window_controller.scale_factor or 1.0
+                )
+                if (
+                    match_delta <= match_limit
+                    and matching_distance
+                        <= closest_distance * self.target_switch_ratio
+                ):
+                    teammate_anchor = matching
+                    teammate_distance = matching_distance
             self.last_teammate_position = teammate_anchor
+            direction_x = teammate_anchor[0] - player_coords[0]
+            direction_y = teammate_anchor[1] - player_coords[1]
+            direction_length = math.hypot(direction_x, direction_y)
+            if direction_length >= 1:
+                self.last_teammate_direction = (
+                    direction_x / direction_length,
+                    direction_y / direction_length,
+                )
+                self.last_teammate_distance = direction_length
             self.last_teammate_seen_at = time.time()
         elif (
-            self.last_teammate_position is not None
+            self.last_teammate_direction is not None
             and time.time() - self.last_teammate_seen_at <= self.teammate_memory_duration
         ):
-            teammate_anchor = self.last_teammate_position
-            teammate_distance = self.get_distance(teammate_anchor, player_coords)
+            # Screen coordinates are camera-relative. Reusing an old absolute
+            # point while the camera follows the player eventually flips the
+            # remembered teammate to the wrong side of the screen. Preserve
+            # only the last observed heading and rebuild an anchor around the
+            # player's current position.
+            teammate_distance = max(
+                self.last_teammate_distance,
+                self.TILE_SIZE * self.window_controller.scale_factor,
+            )
+            teammate_anchor = (
+                player_coords[0]
+                + self.last_teammate_direction[0] * teammate_distance,
+                player_coords[1]
+                + self.last_teammate_direction[1] * teammate_distance,
+            )
         else:
             teammate_distance = float('inf')
         result = (teammate_anchor, teammate_distance)
@@ -585,12 +879,14 @@ class Play:
     def get_teammate_anchor(self, teammate_data):
         if not teammate_data:
             return None
-        positions = [self.get_entity_pos(teammate) for teammate in teammate_data]
-        count = len(positions)
-        return (
-            sum(position[0] for position in positions) / count,
-            sum(position[1] for position in positions) / count,
-        )
+        total_x = 0.0
+        total_y = 0.0
+        for teammate in teammate_data:
+            position = self.get_entity_pos(teammate)
+            total_x += position[0]
+            total_y += position[1]
+        count = len(teammate_data)
+        return total_x / count, total_y / count
 
     def update_teammate_memory(self, teammate_data):
         teammate_anchor = self.get_teammate_anchor(teammate_data)
@@ -599,7 +895,7 @@ class Play:
         self.last_teammate_position = teammate_anchor
         self.last_teammate_seen_at = time.time()
 
-    def is_there_poison_gas(self, player_data, threshold=7000, area_from_player_checked=1.5):
+    def is_there_poison_gas(self, player_data, threshold=7000, area_from_player_checked=4.0):
         now = time.monotonic()
         player_center = self.get_entity_pos(player_data)
         if (
@@ -610,6 +906,7 @@ class Play:
                 <= 8.0 * self.window_controller.scale_factor
         ):
             self.poison_cache_count += 1
+            self._latest_poison_gas = self._poison_cache
             return self._poison_cache.copy()
         self.poison_compute_count += 1
         cache_key = (
@@ -618,7 +915,10 @@ class Play:
         )
         cached = self._decision_cache.get(cache_key)
         if cached is not None:
-            return cached.copy()
+            cached_result, cached_regions = cached
+            self._latest_poison_gas = cached_result
+            self._poison_danger_regions = cached_regions
+            return cached_result.copy()
         actual_player_box = self.get_actual_player_box(player_data) or player_data
         px1, py1, px2, py2 = actual_player_box
         player_width = max(px2 - px1, 1)
@@ -629,30 +929,80 @@ class Play:
         max_y = int(min(py2 + player_height*area_from_player_checked, self.window_controller.height))
 
         if min_x >= max_x or min_y >= max_y:
-            return {
+            result = {
                 "up": 0,
                 "down": 0,
                 "left": 0,
                 "right": 0,
             }
+            self._latest_poison_gas = result
+            self._poison_danger_regions = ()
+            return result.copy()
 
         roi = self.frame[min_y:max_y, min_x:max_x]
-        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
-
-        mask = cv2.inRange(hsv_roi, POISON_LOW_HSV, POISON_HIGH_HSV)
+        roi_shape = roi.shape[:2]
+        if self._poison_buffer_shape != roi_shape:
+            self._poison_buffer_shape = roi_shape
+            self._poison_hsv_buffer = np.empty_like(roi)
+            self._poison_mask_buffer = np.empty(roi_shape, dtype=np.uint8)
+            self._poison_filtered_mask_buffer = np.empty(
+                roi_shape, dtype=np.uint8
+            )
+        hsv_roi = cv2.cvtColor(
+            roi, cv2.COLOR_RGB2HSV, dst=self._poison_hsv_buffer
+        )
+        mask = cv2.inRange(
+            hsv_roi, POISON_LOW_HSV, POISON_HIGH_HSV,
+            dst=self._poison_mask_buffer
+        )
         x, y = self.get_entity_pos(actual_player_box)
         roi_w = int(max_x - min_x)
         roi_h = int(max_y - min_y)
         local_px = int(clamp(x - min_x, 0, roi_w))
         local_py = int(clamp(y - min_y, 0, roi_h))
 
+        # Keep the actual gas geometry. Direction totals cannot distinguish a
+        # safe opening beside a wall from poison covering the whole direction.
+        minimum_storm_area = max(36.0, 0.0015 * float(roi_w * roi_h))
+        contours, _ = cv2.findContours(
+            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        danger_regions = []
+        storm_contours = []
+        edge_margin = max(2, round(min(roi_w, roi_h) * 0.01))
+        for contour in contours:
+            if cv2.contourArea(contour) < minimum_storm_area:
+                continue
+            region_x, region_y, region_w, region_h = cv2.boundingRect(contour)
+            if not (
+                region_x <= edge_margin
+                or region_y <= edge_margin
+                or region_x + region_w >= roi_w - edge_margin
+                or region_y + region_h >= roi_h - edge_margin
+            ):
+                # Real poison enters this player-centred scan from outside;
+                # isolated matching map/UI colours inside the ROI are noise.
+                continue
+            storm_contours.append(contour)
+            danger_regions.append((
+                min_x + region_x,
+                min_y + region_y,
+                min_x + region_x + region_w,
+                min_y + region_y + region_h,
+            ))
+        danger_regions = tuple(danger_regions)
+        filtered_mask = self._poison_filtered_mask_buffer
+        filtered_mask.fill(0)
+        if storm_contours:
+            cv2.drawContours(
+                filtered_mask, storm_contours, -1, 255, thickness=cv2.FILLED
+            )
         counts = {
-            "up": count_mask_pixels(mask, 0, 0, roi_w, local_py),
-            "down": count_mask_pixels(mask, 0, local_py, roi_w, roi_h),
-            "left": count_mask_pixels(mask, 0, 0, local_px, roi_h),
-            "right": count_mask_pixels(mask, local_px, 0, roi_w, roi_h),
+            "up": cv2.countNonZero(filtered_mask[:local_py, :roi_w]),
+            "down": cv2.countNonZero(filtered_mask[local_py:roi_h, :roi_w]),
+            "left": cv2.countNonZero(filtered_mask[:roi_h, :local_px]),
+            "right": cv2.countNonZero(filtered_mask[:roi_h, local_px:roi_w]),
         }
-
         result = {
             direction: count if count > threshold else 0
             for direction, count in counts.items()
@@ -677,11 +1027,41 @@ class Play:
                         cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
                     )
 
-        self._decision_cache[cache_key] = result
-        self._poison_cache = result.copy()
+        self._decision_cache[cache_key] = (result, danger_regions)
+        # Callers always receive a copy, so both internal caches can safely
+        # share the same read-only-by-convention result dictionary.
+        self._poison_cache = result
+        self._latest_poison_gas = result
+        self._poison_danger_regions = danger_regions
         self._poison_cache_at = now
         self._poison_cache_player = player_center
         return result.copy()
+
+    def _directional_poison_danger(self):
+        poison = self._latest_poison_gas
+        highest = max(poison.values(), default=0)
+        if highest <= 0:
+            return (0.0, 0.0, 0.0, 0.0)
+        inverse = 1.0 / highest
+        return (
+            poison.get("up", 0) * inverse,
+            poison.get("down", 0) * inverse,
+            poison.get("left", 0) * inverse,
+            poison.get("right", 0) * inverse,
+        )
+
+    def _movement_poison_risk(self, movement):
+        x, y = movement
+        magnitude = math.hypot(x, y)
+        if magnitude < 1:
+            return float("inf")
+        up, down, left, right = self._directional_poison_danger()
+        return (
+            (left if x < 0 else right if x > 0 else 0.0)
+            * abs(x) / magnitude
+            + (up if y < 0 else down if y > 0 else 0.0)
+            * abs(y) / magnitude
+        )
 
     def get_main_data(self, frame, cache_for_reuse=False):
         prepared_frame = self._prepared_frame_ref() if self._prepared_frame_ref else None
@@ -706,22 +1086,41 @@ class Play:
         self.wall_scene_gate.reset()
         self.last_walls_data = []
         self.last_bushes_data = []
+        self._wall_tracks = []
+        self._wall_navigation_ready = False
         self.time_since_walls_checked = 0
         self._target_memory.clear()
         self._prepared_frame_ref = None
         self._prepared_main_data = None
         self.last_attack_at = 0.0
+        self._attack_authorized_until = 0.0
+        self._super_authorized_until = 0.0
+        self._current_enemy_data = ()
         self.objective_position = None
         self.objective_expires_at = 0.0
         self.last_teammate_position = None
+        self.last_teammate_direction = None
+        self.last_teammate_distance = 0.0
         self.last_teammate_seen_at = 0.0
         self.path_planner.reset()
         self._detour_heading = None
         self._detour_goal_heading = None
         self._detour_expires_at = 0.0
+        self._direct_clear_since = 0.0
+        self._exploration_heading = (0.0, -JOYSTICK_RADIUS)
+        self._exploration_expires_at = 0.0
+        self._exploration_index = 0
+        self._obstacle_progress_center = None
+        self._obstacle_progress_at = 0.0
+        self._obstacle_escape_side = 1
+        self._obstacle_stuck_count = 0
         self._poison_cache = None
         self._poison_cache_at = 0.0
         self._poison_cache_player = None
+        self._latest_poison_gas = {
+            "up": 0, "down": 0, "left": 0, "right": 0,
+        }
+        self._poison_danger_regions = ()
         for ability in self._ability_used_at:
             self._ability_used_at[ability] = 0.0
 
@@ -749,6 +1148,12 @@ class Play:
         hit_circle_center, hit_circle_radius = self.get_player_hit_circle(player_box)
         if hit_circle_center is None:
             return False
+        # Match the clearance used by A* smoothing. Without a small common
+        # margin, a waypoint could be safe while the final joystick guard
+        # still approved a detector-jittered wall-edge collision.
+        hit_circle_radius += (
+            self.navigation_wall_padding * self.window_controller.scale_factor
+        )
 
         new_pos = (hit_circle_center[0] + dx, hit_circle_center[1] + dy)
         nearby_walls = self._nearby_walls(
@@ -785,15 +1190,29 @@ class Play:
     def _segment_blocked(start, end, radius, walls):
         return Play.walls_block_swept_circle(start, end, radius, walls)
 
+    def _navigation_visible_radius(self):
+        # centered_wall_crop_size is already measured in pixels of the current
+        # captured frame. Multiplying it by scale_factor again shortened A*'s
+        # lookahead disproportionately on low-resolution devices.
+        visible_size = self.centered_wall_crop_size
+        if self.window_controller.width:
+            visible_size = min(visible_size, self.window_controller.width)
+        if self.window_controller.height:
+            visible_size = min(visible_size, self.window_controller.height)
+        return visible_size * 0.45
+
     def _best_open_movement(self, movement, player_box, walls):
         """Choose the next waypoint on a shortest local A* route."""
         start, player_radius = self.get_player_hit_circle(player_box)
         magnitude = math.hypot(*movement)
-        if start is None or magnitude < 1 or not walls:
+        if start is None or magnitude < 1:
             return movement
 
+        scale_factor = self.window_controller.scale_factor
+        planning_horizon = self.TILE_SIZE * 4.5 * scale_factor
         known_distance = min(
-            magnitude, self.centered_wall_crop_size * 0.45 * self.window_controller.scale_factor
+            max(magnitude, planning_horizon),
+            self._navigation_visible_radius(),
         )
         goal = (
             start[0] + movement[0] / magnitude * known_distance,
@@ -801,24 +1220,139 @@ class Play:
         )
         nearby = self._nearby_walls(player_box, walls, known_distance + player_radius)
         navigation_now = time.monotonic()
+        poison_danger = self._directional_poison_danger()
+        nearest_wall = None
+        if nearby:
+            nearest_wall = None
+            if self._obstacle_progress_center is not None:
+                tracked_wall = min(
+                    nearby,
+                    key=lambda wall: self.get_distance(
+                        (
+                            (wall[0] + wall[2]) * 0.5,
+                            (wall[1] + wall[3]) * 0.5,
+                        ),
+                        self._obstacle_progress_center,
+                    ),
+                )
+                tracked_center = (
+                    (tracked_wall[0] + tracked_wall[2]) * 0.5,
+                    (tracked_wall[1] + tracked_wall[3]) * 0.5,
+                )
+                if self.get_distance(
+                    tracked_center, self._obstacle_progress_center
+                ) <= self.TILE_SIZE * 2.0 * scale_factor:
+                    nearest_wall = tracked_wall
+            if nearest_wall is None:
+                # Start tracking the physically nearest obstacle only when
+                # the previous one has genuinely left the local scene. This
+                # avoids corner jitter alternating between two wall runs.
+                nearest_wall = min(
+                    nearby,
+                    key=lambda wall: self.point_rect_distance_sq(
+                        start, wall[:4]
+                    ),
+                )
+                self._obstacle_progress_center = None
+            wall_center = (
+                (nearest_wall[0] + nearest_wall[2]) * 0.5,
+                (nearest_wall[1] + nearest_wall[3]) * 0.5,
+            )
+            if self._obstacle_progress_center is None:
+                self._obstacle_progress_center = wall_center
+                self._obstacle_progress_at = navigation_now
+            elif self.get_distance(
+                wall_center, self._obstacle_progress_center
+            ) >= 12.0 * self.window_controller.scale_factor:
+                # Camera-relative obstacle motion proves that movement made
+                # progress, even though the player remains screen-centred.
+                self._obstacle_progress_center = wall_center
+                self._obstacle_progress_at = navigation_now
+                self._obstacle_stuck_count = 0
+            elif navigation_now - self._obstacle_progress_at >= 1.2:
+                self._obstacle_stuck_count += 1
+                self._obstacle_escape_side *= -1
+                wall_width = nearest_wall[2] - nearest_wall[0]
+                wall_height = nearest_wall[3] - nearest_wall[1]
+                if self._obstacle_stuck_count >= 2:
+                    self._detour_heading = self.normalize_move(
+                        start[0] - wall_center[0],
+                        start[1] - wall_center[1],
+                    )
+                    self._obstacle_stuck_count = 0
+                elif wall_width >= wall_height:
+                    self._detour_heading = (
+                        JOYSTICK_RADIUS * self._obstacle_escape_side, 0.0
+                    )
+                else:
+                    self._detour_heading = (
+                        0.0, JOYSTICK_RADIUS * self._obstacle_escape_side
+                    )
+                self._detour_expires_at = (
+                    navigation_now + self.detour_commit_seconds
+                )
+                self._obstacle_progress_center = wall_center
+                self._obstacle_progress_at = navigation_now
+                self.path_planner.reset()
+        else:
+            self._obstacle_progress_center = None
+            self._obstacle_progress_at = 0.0
+            self._obstacle_stuck_count = 0
+        if (
+            self._detour_heading is not None
+            and max(poison_danger) > 0
+            and self._movement_poison_risk(self._detour_heading)
+                > self._movement_poison_risk(movement) + 0.05
+        ):
+            # Storm safety overrides a side commitment made before the gas
+            # reached this local area.
+            self._detour_heading = None
+            self._detour_goal_heading = None
+            self._detour_expires_at = 0.0
         preferred_heading = (
             self._detour_heading
             if self._detour_heading is not None
             and navigation_now < self._detour_expires_at
-            else self.last_movement if self.last_movement else movement
+            else movement
         )
         path = self.path_planner.plan(
-            start, goal, nearby, player_radius, navigation_now, preferred_heading
+            start, goal, nearby, player_radius, navigation_now,
+            preferred_heading, poison_danger, self._poison_danger_regions,
         )
         if path:
-            # Skip grid points already visible from the player. This removes
-            # staircase movement while retaining A*'s obstacle choice.
+            # The planner has already smoothed this into the farthest safe
+            # waypoint while checking both walls and storm. A second shortcut
+            # here used to ignore storm geometry and destabilize the route.
             waypoint = path[0]
-            for candidate in path[1:]:
-                if self._segment_blocked(start, candidate, player_radius, nearby):
-                    break
-                waypoint = candidate
             result = waypoint[0] - start[0], waypoint[1] - start[1]
+            previous_detour = self._detour_heading
+            if (
+                previous_detour is not None
+                and navigation_now < self._detour_expires_at
+            ):
+                previous_length = math.hypot(*previous_detour)
+                result_length = math.hypot(*result)
+                if previous_length >= 1 and result_length >= 1:
+                    direction_cosine = (
+                        previous_detour[0] * result[0]
+                        + previous_detour[1] * result[1]
+                    ) / (previous_length * result_length)
+                    commitment_lookahead = (
+                        self.TILE_SIZE * 1.5 * scale_factor
+                    )
+                    if (
+                        direction_cosine < 0.25
+                        and not self.is_path_blocked(
+                            player_box, previous_detour, walls,
+                            distance=commitment_lookahead,
+                        )
+                        and self._movement_poison_risk(previous_detour)
+                            <= self._movement_poison_risk(result) + 0.05
+                    ):
+                        # Keep the original expiry. Extending it here would
+                        # prevent a legitimate turn after reaching a corner.
+                        self.detour_reversals_prevented += 1
+                        return previous_detour
             self._detour_heading = result
             self._detour_goal_heading = (
                 movement[0] / magnitude, movement[1] / magnitude
@@ -827,10 +1361,100 @@ class Play:
             return result
 
         # Fully enclosed/noisy detections: deterministic angular fallback.
-        offsets = (math.pi / 4, -math.pi / 4, math.pi / 2, -math.pi / 2, math.pi)
+        side = self._obstacle_escape_side
+        offsets = (
+            side * math.pi / 4, -side * math.pi / 4,
+            side * math.pi / 2, -side * math.pi / 2,
+            side * 3 * math.pi / 4, -side * 3 * math.pi / 4,
+            math.pi,
+        )
         lookahead = self.TILE_SIZE * 1.5 * self.window_controller.scale_factor
-        for offset in offsets:
-            candidate = self.rotate_movement(movement, offset)
+        candidates = [
+            self.rotate_movement(movement, offset) for offset in offsets
+        ]
+        # Long water/wall strips can span the complete local A* window. Add
+        # geometry-derived tangents and an outward normal so the fallback
+        # follows the obstacle edge instead of repeatedly pushing into it.
+        if nearest_wall is not None:
+            wall_x1, wall_y1, wall_x2, wall_y2 = nearest_wall[:4]
+            wall_width = wall_x2 - wall_x1
+            wall_height = wall_y2 - wall_y1
+            wall_center_x = (wall_x1 + wall_x2) * 0.5
+            wall_center_y = (wall_y1 + wall_y2) * 0.5
+            away = self.normalize_move(
+                start[0] - wall_center_x,
+                start[1] - wall_center_y,
+            )
+            # When a noisy box overlaps the estimated player circle, moving
+            # away from the wall centre can still be diagonal to its closest
+            # edge and collide with a neighbouring tile. Add the shortest
+            # axis-aligned exit from the inflated wall first.
+            clearance_radius = player_radius + (
+                self.navigation_wall_padding * scale_factor
+            )
+            inflated = (
+                wall_x1 - clearance_radius, wall_y1 - clearance_radius,
+                wall_x2 + clearance_radius, wall_y2 + clearance_radius,
+            )
+            escape = None
+            if (
+                inflated[0] <= start[0] <= inflated[2]
+                and inflated[1] <= start[1] <= inflated[3]
+            ):
+                _, escape_x, escape_y = min(
+                    (
+                        (start[0] - inflated[0], -1.0, 0.0),
+                        (inflated[2] - start[0], 1.0, 0.0),
+                        (start[1] - inflated[1], 0.0, -1.0),
+                        (inflated[3] - start[1], 0.0, 1.0),
+                    ),
+                    key=lambda item: item[0],
+                )
+                escape = self.normalize_move(escape_x, escape_y)
+            if wall_width >= wall_height:
+                tangents = (
+                    (JOYSTICK_RADIUS * self._obstacle_escape_side, 0.0),
+                    (-JOYSTICK_RADIUS * self._obstacle_escape_side, 0.0),
+                )
+            else:
+                tangents = (
+                    (0.0, JOYSTICK_RADIUS * self._obstacle_escape_side),
+                    (0.0, -JOYSTICK_RADIUS * self._obstacle_escape_side),
+                )
+            geometry_candidates = [away, *tangents]
+            if escape is not None:
+                geometry_candidates.insert(0, escape)
+            # The exact overlap exit must precede generic angular guesses;
+            # stable sorting by poison risk preserves this order when risks
+            # are equal (the common non-storm case).
+            candidates = geometry_candidates + candidates
+        # Preserve order while removing equivalent vectors before collision
+        # checks; this bounds fallback work when rotated and tangent choices
+        # overlap.
+        unique_candidates = []
+        seen_candidates = set()
+        for candidate in candidates:
+            candidate_key = (round(candidate[0], 2), round(candidate[1], 2))
+            if candidate_key in seen_candidates:
+                continue
+            seen_candidates.add(candidate_key)
+            unique_candidates.append(candidate)
+        candidates = unique_candidates
+        desired_length = math.hypot(*movement)
+
+        def fallback_score(candidate):
+            candidate_length = math.hypot(*candidate)
+            alignment = (
+                (candidate[0] * movement[0] + candidate[1] * movement[1])
+                / (candidate_length * desired_length)
+                if candidate_length >= 1 and desired_length >= 1 else -1.0
+            )
+            # Storm safety remains dominant, then choose the open direction
+            # with the most forward progress toward the strategic objective.
+            return self._movement_poison_risk(candidate), -alignment
+
+        candidates.sort(key=fallback_score)
+        for candidate in candidates:
             if not self.is_path_blocked(player_box, candidate, walls, distance=lookahead):
                 self._detour_heading = candidate
                 self._detour_goal_heading = (
@@ -838,9 +1462,30 @@ class Play:
                 )
                 self._detour_expires_at = navigation_now + self.detour_commit_seconds
                 return candidate
-        return self.rotate_movement(movement, math.pi)
+        # If noisy/overlapping wall boxes claim every sampled direction is
+        # blocked, preserve the last committed heading instead of reversing
+        # every frame. A stable push can escape the overlap on the next frame.
+        if max(poison_danger) > 0:
+            # With gas present, a possibly noisy wall box is less dangerous
+            # than deliberately retaining a direction into the storm.
+            fallback = candidates[0]
+        else:
+            fallback = (
+                self._detour_heading
+                if self._detour_heading is not None
+                and navigation_now < self._detour_expires_at
+                else self.last_movement if self.last_movement else movement
+            )
+        self._detour_heading = fallback
+        self._detour_goal_heading = (
+            movement[0] / magnitude, movement[1] / magnitude
+        )
+        self._detour_expires_at = navigation_now + self.detour_commit_seconds
+        return fallback
 
     def navigation_correction(self, movement, player_box, walls):
+        if not self._wall_navigation_ready:
+            return (0.0, 0.0)
         magnitude = math.hypot(*movement)
         if magnitude >= 1 and self._detour_goal_heading is not None:
             goal_heading = movement[0] / magnitude, movement[1] / magnitude
@@ -852,20 +1497,39 @@ class Play:
                 self._detour_heading = None
                 self._detour_goal_heading = None
                 self._detour_expires_at = 0.0
+        scale_factor = self.window_controller.scale_factor
         direct_distance = min(
-            magnitude,
-            self.centered_wall_crop_size * 0.45 * self.window_controller.scale_factor,
+            max(magnitude, self.TILE_SIZE * 4.5 * scale_factor),
+            self._navigation_visible_radius(),
         )
-        # Straight-line movement always wins. A stale detour must never
-        # override a newly opened direct path to the current goal.
-        if magnitude < 1 or not self.is_path_blocked(
+        direct_is_blocked = self.is_path_blocked(
             player_box, movement, walls, distance=direct_distance
+        )
+        direct_poison_risk = self._movement_poison_risk(movement)
+        # Straight movement wins only when it is both unobstructed and safe.
+        # Previously a clear line bypassed A* even when it pointed into gas.
+        if magnitude < 1 or (
+            not direct_is_blocked and direct_poison_risk < 0.08
         ):
-            self._detour_heading = None
-            self._detour_goal_heading = None
-            self._detour_expires_at = 0.0
+            # Move directly when it is clear, but retain the committed side
+            # until its short expiry. If a wall box flickers back next frame,
+            # A* will continue on the same side instead of oscillating.
+            now = time.monotonic()
+            if magnitude < 1:
+                self._direct_clear_since = 0.0
+            elif self._direct_clear_since <= 0:
+                self._direct_clear_since = now
+            if (
+                now >= self._detour_expires_at
+                or self._direct_clear_since > 0
+                and now - self._direct_clear_since >= 0.25
+            ):
+                self._detour_heading = None
+                self._detour_goal_heading = None
+                self._detour_expires_at = 0.0
             return movement
 
+        self._direct_clear_since = 0.0
         return self._best_open_movement(movement, player_box, walls)
 
     @staticmethod
@@ -877,7 +1541,21 @@ class Play:
         # lists. A key therefore no longer proves that an object was detected.
         for name in ("player", "enemy", "teammate", "wall", "bush"):
             boxes = data.get(name) or []
-            data[name] = [box for box in boxes if box is not None and len(box) >= 4]
+            # Detector/stabilizer output is normally already valid. Preserve
+            # those lists so the hot loop allocates nothing here. Fall back to
+            # the original filtering behavior only for malformed data.
+            if isinstance(boxes, list):
+                all_valid = True
+                for box in boxes:
+                    if box is None or len(box) < 4:
+                        all_valid = False
+                        break
+                if all_valid:
+                    data[name] = boxes
+                    continue
+            data[name] = [
+                box for box in boxes if box is not None and len(box) >= 4
+            ]
 
         return data if data["player"] else False
 
@@ -941,7 +1619,12 @@ class Play:
             return None
         # Cache is valid only for this immutable frame's decision script.
         self._decision_cache.clear()
-        self.update_teammate_memory(data['teammate'])
+        self._attack_authorized_until = 0.0
+        self._super_authorized_until = 0.0
+        self._current_enemy_data = tuple(data['enemy'])
+        # Navigation safety must not depend on the selected playstyle opting
+        # into poison detection.
+        self.is_there_poison_gas(data['player'][0])
         if self.context is None:
             self.context = {
                 'brawlers_info': self.brawlers_info,
@@ -957,6 +1640,7 @@ class Play:
                 'use_super': self.use_super,
                 'use_gadget': self.use_gadget,
                 'get_random_movement': self.get_random_movement,
+                'get_exploration_movement': self.get_exploration_movement,
                 'remember_objective': self.remember_objective,
                 'get_recent_objective_movement': self.get_recent_objective_movement,
                 'seconds_to_hold_attack_after_reaching_max': self.seconds_to_hold_attack_after_reaching_max,
@@ -976,45 +1660,173 @@ class Play:
                 'width_ratio': self.window_controller.width_ratio,
                 'height_ratio': self.window_controller.height_ratio
             }
-        self._dynamic_context = {
-            'player_data': data['player'][0],
-            'enemy_data': data['enemy'],
-            'teammate_data': data['teammate'],
-            'brawler': brawler,
-            'walls': data['wall'],
-            'bushes': data['bush'],
-            'is_gadget_ready': self.is_gadget_ready,
-            'is_hypercharge_ready': self.is_hypercharge_ready,
-            'is_super_ready': self.is_super_ready,
-            'current_brawler': self.current_brawler,
-            'last_movement': self.last_movement,
-            'last_movement_change_time': self.last_movement_change_time,
-            'debug': self.verbose_debug,
-        }
+        dynamic = self._dynamic_context
+        dynamic['player_data'] = data['player'][0]
+        dynamic['enemy_data'] = data['enemy']
+        dynamic['teammate_data'] = data['teammate']
+        dynamic['brawler'] = brawler
+        dynamic['walls'] = data['wall']
+        dynamic['bushes'] = data['bush']
+        dynamic['is_gadget_ready'] = self.is_gadget_ready
+        dynamic['is_hypercharge_ready'] = self.is_hypercharge_ready
+        dynamic['is_super_ready'] = self.is_super_ready
+        dynamic['current_brawler'] = self.current_brawler
+        dynamic['last_movement'] = self.last_movement
+        dynamic['last_movement_change_time'] = self.last_movement_change_time
+        dynamic['debug'] = self.verbose_debug
         if self._playstyle_globals is None or not self._playstyle_context_initialized:
             self.context.update(self._dynamic_context)
         movement = self.get_movement()
         movement_vector = self.movement_to_vector(movement)
+        if (
+            (movement_vector is None or math.hypot(*movement_vector) < 1)
+            and not data['enemy']
+            and not data['teammate']
+        ):
+            movement_vector = self.get_exploration_movement(
+                data['player'][0], data['wall']
+            )
         if movement_vector is None:
             self.window_controller.release_movement()
             self.last_movement = ''
             return None
+        strategic_movement = movement_vector
         movement_vector = self.navigation_correction(
             movement_vector, data['player'][0], data['wall']
         )
-        movement = self.clamp_movement(movement_vector)
+        planned_movement = self.clamp_movement(movement_vector)
+        if not self._wall_navigation_ready:
+            self.last_movement = (0.0, 0.0)
+            self.last_movement_change_time = time.time()
+            return self.last_movement
+        movement = planned_movement
         current_time = time.time()
         if self.last_movement and self.movement_is_similar(movement, self.last_movement):
             movement = self.last_movement
-            self.last_movement_change_time = current_time
         elif movement != self.last_movement:
             if current_time - self.last_movement_change_time >= self.minimum_movement_delay:
                 self.last_movement = movement
                 self.last_movement_change_time = current_time
             else:
                 movement = self.last_movement
-        else:
+
+        # Do not let timing hysteresis keep a formerly clear direction after
+        # A* has already seen an obstacle farther ahead. Waiting until the
+        # short collision guard reached the wall caused late, alternating
+        # left/right corrections. A valid planned detour takes precedence as
+        # soon as the stale direction conflicts with the planning horizon.
+        commitment_distance = min(
+            self.TILE_SIZE * 4.5 * self.window_controller.scale_factor,
+            self._navigation_visible_radius(),
+        )
+        planned_validation_distance = min(
+            commitment_distance,
+            max(
+                self.TILE_SIZE * 0.9 * self.window_controller.scale_factor,
+                math.hypot(*movement_vector),
+            ),
+        )
+        if (
+            movement != planned_movement
+            and self.is_path_blocked(
+                data['player'][0], movement, data['wall'],
+                distance=commitment_distance,
+            )
+            and not self.is_path_blocked(
+                data['player'][0], planned_movement, data['wall'],
+                distance=planned_validation_distance,
+            )
+        ):
+            self.stale_movement_overrides += 1
+            movement = planned_movement
+            self.last_movement = movement
             self.last_movement_change_time = current_time
+
+        # Hysteresis is never allowed to restore a stale direction through an
+        # obstacle after navigation has selected a safe detour.
+        safety_distance = (
+            self.TILE_SIZE * 0.9 * self.window_controller.scale_factor
+        )
+        if self.is_path_blocked(
+            data['player'][0], movement, data['wall'],
+            distance=safety_distance,
+        ):
+            self.collision_corrections += 1
+            if not self.is_path_blocked(
+                data['player'][0], planned_movement, data['wall'],
+                distance=safety_distance,
+            ):
+                movement = planned_movement
+            else:
+                side = self._obstacle_escape_side
+                rescue_offsets = (
+                    side * math.pi / 2,
+                    -side * math.pi / 2,
+                    side * math.pi / 4,
+                    -side * math.pi / 4,
+                    math.pi,
+                )
+                rescue_candidates = [
+                    self.rotate_movement(planned_movement, offset)
+                    for offset in rescue_offsets
+                ]
+                planned_length = math.hypot(*planned_movement)
+
+                def rescue_score(candidate):
+                    candidate_length = math.hypot(*candidate)
+                    alignment = (
+                        (
+                            candidate[0] * planned_movement[0]
+                            + candidate[1] * planned_movement[1]
+                        ) / (candidate_length * planned_length)
+                        if candidate_length >= 1 and planned_length >= 1
+                        else -1.0
+                    )
+                    return self._movement_poison_risk(candidate), -alignment
+
+                rescue_candidates.sort(key=rescue_score)
+                movement = next(
+                    (
+                        candidate for candidate in rescue_candidates
+                        if not self.is_path_blocked(
+                            data['player'][0], candidate, data['wall'],
+                            distance=safety_distance,
+                        )
+                    ),
+                    (0.0, 0.0),
+                )
+                if math.hypot(*movement) < 1:
+                    self.collision_stops += 1
+                self.path_planner.reset()
+            self.last_movement = movement
+            self.last_movement_change_time = current_time
+
+        # Final strategic invariant: a clear and storm-safe objective may not
+        # leave the joystick pointing into the opposite half-plane. This
+        # catches stale hysteresis/detour state after every lower-level guard,
+        # while still permitting a genuine opposite-side wall detour.
+        strategic_length = math.hypot(*strategic_movement)
+        output_length = math.hypot(*movement)
+        if strategic_length >= 1 and output_length >= 1:
+            strategic_cosine = (
+                strategic_movement[0] * movement[0]
+                + strategic_movement[1] * movement[1]
+            ) / (strategic_length * output_length)
+            if (
+                strategic_cosine < 0.0
+                and self._movement_poison_risk(strategic_movement) < 0.08
+                and not self.is_path_blocked(
+                    data['player'][0], strategic_movement, data['wall'],
+                    distance=commitment_distance,
+                )
+            ):
+                movement = self.clamp_movement(strategic_movement)
+                self.last_movement = movement
+                self.last_movement_change_time = current_time
+                self._detour_heading = None
+                self._detour_goal_heading = None
+                self._detour_expires_at = 0.0
+                self.opposite_goal_overrides += 1
         return movement
 
     def _ability_crop(self, frame, name, area):
@@ -1036,13 +1848,34 @@ class Play:
     def _ability_ready(self, frame, name, area, low_hsv, high_hsv, minimum):
         screenshot = self._ability_crop(frame, name, area)
         scale = self.ability_detection_scale
+        source_shape = screenshot.shape
+        buffers = self._ability_processing_buffers.get(name)
+        if buffers is not None and buffers[0] != source_shape:
+            buffers = None
         if scale < 1.0 and screenshot.size:
-            screenshot = cv2.resize(
-                screenshot, None, fx=scale, fy=scale,
-                interpolation=cv2.INTER_AREA,
-            )
+            if buffers is None or buffers[1] is None:
+                screenshot = cv2.resize(
+                    screenshot, None, fx=scale, fy=scale,
+                    interpolation=cv2.INTER_AREA,
+                )
+            else:
+                resized = buffers[1]
+                screenshot = cv2.resize(
+                    screenshot, (resized.shape[1], resized.shape[0]),
+                    dst=resized, interpolation=cv2.INTER_AREA,
+                )
             minimum *= scale * scale
-        pixels = count_hsv_pixels(screenshot, low_hsv, high_hsv, self.window_controller)
+        shape = screenshot.shape
+        if buffers is None or buffers[2].shape != shape:
+            resized_buffer = screenshot if scale < 1.0 else None
+            hsv_buffer = np.empty(shape, dtype=np.uint8)
+            mask_buffer = np.empty(shape[:2], dtype=np.uint8)
+            buffers = (source_shape, resized_buffer, hsv_buffer, mask_buffer)
+            self._ability_processing_buffers[name] = buffers
+        pixels = count_hsv_pixels(
+            screenshot, low_hsv, high_hsv, self.window_controller,
+            hsv_buffer=buffers[2], mask_buffer=buffers[3]
+        )
         if self.verbose_debug:
             print(f"{name} pixels:", pixels, "(if > ", minimum, f" then {name} is ready)")
             try:
@@ -1074,15 +1907,27 @@ class Play:
 
     def get_centered_wall_crop(self, frame, player_data=None):
         frame_height, frame_width = frame.shape[:2]
-        crop_size = self.centered_wall_crop_size
+        # Low-end devices often capture at 960x540 or 1280x720. A fixed
+        # 640px square is taller than a 540px frame; the old clamp then got a
+        # negative upper bound and sliced only a thin strip from the bottom.
+        # That made terrain effectively invisible to both A* and shot LOS.
+        crop_size = min(
+            self.centered_wall_crop_size, frame_width, frame_height
+        )
+        if crop_size <= 0:
+            return frame, 0, 0
 
         if player_data:
             center_x, center_y = self.get_entity_pos(player_data[0])
         else:
             center_x, center_y = frame_width / 2, frame_height / 2
 
-        crop_x1 = int(clamp(round(center_x - crop_size / 2), 0, frame_width - crop_size))
-        crop_y1 = int(clamp(round(center_y - crop_size / 2), 0, frame_height - crop_size))
+        crop_x1 = int(clamp(
+            round(center_x - crop_size / 2), 0, frame_width - crop_size
+        ))
+        crop_y1 = int(clamp(
+            round(center_y - crop_size / 2), 0, frame_height - crop_size
+        ))
         crop_x2 = crop_x1 + crop_size
         crop_y2 = crop_y1 + crop_size
 
@@ -1171,6 +2016,83 @@ class Play:
             name="pyla-wall-model-loader",
         ).start()
 
+    def stabilize_wall_boxes(self, walls):
+        """Smooth wall detections and survive one missed inference."""
+        previous_tracks = self._wall_tracks
+        if not previous_tracks:
+            self._wall_tracks = [(list(wall[:4]), 0) for wall in walls]
+            return [track[0] for track in self._wall_tracks]
+
+        unmatched_previous = set(range(len(previous_tracks)))
+        updated_tracks = []
+        scale_factor = self.window_controller.scale_factor
+        base_match_distance = self.TILE_SIZE * 1.5 * scale_factor
+
+        for wall in walls:
+            new_box = list(map(float, wall[:4]))
+            new_center = (
+                (new_box[0] + new_box[2]) * 0.5,
+                (new_box[1] + new_box[3]) * 0.5,
+            )
+            new_width = max(1.0, new_box[2] - new_box[0])
+            new_height = max(1.0, new_box[3] - new_box[1])
+            best_index = None
+            best_score = float("inf")
+            for index in sorted(unmatched_previous):
+                old_box, _ = previous_tracks[index]
+                old_center = (
+                    (old_box[0] + old_box[2]) * 0.5,
+                    (old_box[1] + old_box[3]) * 0.5,
+                )
+                old_width = max(1.0, old_box[2] - old_box[0])
+                old_height = max(1.0, old_box[3] - old_box[1])
+                center_distance = self.get_distance(new_center, old_center)
+                match_distance = max(
+                    base_match_distance,
+                    0.35 * max(new_width, new_height, old_width, old_height),
+                )
+                if center_distance > match_distance:
+                    continue
+                size_error = (
+                    abs(new_width - old_width) / max(new_width, old_width)
+                    + abs(new_height - old_height) / max(new_height, old_height)
+                )
+                score = center_distance / match_distance + size_error * 0.35
+                if score < best_score:
+                    best_score = score
+                    best_index = index
+
+            if best_index is None:
+                updated_tracks.append((new_box, 0))
+                continue
+
+            unmatched_previous.remove(best_index)
+            old_box, _ = previous_tracks[best_index]
+            # Prefer current geometry while suppressing a few pixels of model
+            # jitter that would otherwise invalidate and flip an A* route.
+            smoothed = [
+                old_value * 0.25 + new_value * 0.75
+                for old_value, new_value in zip(old_box, new_box)
+            ]
+            updated_tracks.append((smoothed, 0))
+
+        # A completely empty inference is more likely a transient model miss
+        # than every nearby wall vanishing simultaneously. Bridge two such
+        # refreshes; when some current geometry exists, retain unmatched old
+        # boxes for only one refresh to avoid long-lived ghost obstacles.
+        maximum_misses = 2 if not walls else 1
+        for index in sorted(unmatched_previous):
+            old_box, misses = previous_tracks[index]
+            if misses < maximum_misses:
+                updated_tracks.append((old_box, misses + 1))
+
+        updated_tracks.sort(key=lambda track: (
+            round(track[0][1], 1), round(track[0][0], 1),
+            round(track[0][3], 1), round(track[0][2], 1),
+        ))
+        self._wall_tracks = updated_tracks
+        return [track[0] for track in updated_tracks]
+
     def process_tile_data(self, tile_data):
         walls = []
         bushes = []
@@ -1179,7 +2101,8 @@ class Play:
                 walls.extend(boxes)
             else:
                 bushes.extend(boxes)
-        return self.merge_collinear_walls(walls), bushes
+        walls = self.merge_collinear_walls(walls)
+        return self.stabilize_wall_boxes(walls), bushes
 
     def merge_collinear_walls(self, walls):
         """Merge straight tile runs in bounded O(n²), preserving L corners."""
@@ -1187,9 +2110,16 @@ class Play:
             return walls
         gap_limit = self.TILE_SIZE * 0.3 * self.window_controller.scale_factor
         boxes = [list(map(float, wall[:4])) for wall in walls]
+        dimensions = [
+            (
+                max(1.0, box[2] - box[0]),
+                max(1.0, box[3] - box[1]),
+            )
+            for box in boxes
+        ]
 
         def connected_components(indices, horizontal):
-            parent = {index: index for index in indices}
+            parent = list(range(len(boxes)))
 
             def find(index):
                 while parent[index] != index:
@@ -1204,13 +2134,11 @@ class Play:
 
             for offset, first_index in enumerate(indices):
                 first = boxes[first_index]
-                first_width = max(1.0, first[2] - first[0])
-                first_height = max(1.0, first[3] - first[1])
+                first_width, first_height = dimensions[first_index]
                 for second_offset in range(offset + 1, len(indices)):
                     second_index = indices[second_offset]
                     second = boxes[second_index]
-                    second_width = max(1.0, second[2] - second[0])
-                    second_height = max(1.0, second[3] - second[1])
+                    second_width, second_height = dimensions[second_index]
                     if horizontal:
                         overlap = max(
                             0.0, min(first[3], second[3])
@@ -1238,7 +2166,12 @@ class Play:
 
             groups = {}
             for index in indices:
-                groups.setdefault(find(index), []).append(index)
+                root = find(index)
+                members = groups.get(root)
+                if members is None:
+                    members = []
+                    groups[root] = members
+                members.append(index)
             return list(groups.values())
 
         all_indices = list(range(len(boxes)))
@@ -1358,10 +2291,19 @@ class Play:
                 tile_data = self.get_tile_data(frame, data.get("player"))
                 if tile_data is None:
                     # The model is still warming during matchmaking. Keep the
-                    # entity AI moving and retry walls on a later frame.
+                    # last geometry only briefly. Screen-space wall boxes
+                    # become unsafe after camera movement, so stop navigation
+                    # rather than steering through a stale obstacle map.
                     self.wall_inference_count -= 1
                     data['wall'] = self.last_walls_data
                     data['bush'] = self.last_bushes_data
+                    if (
+                        current_time - self.time_since_walls_checked
+                        > self.wall_navigation_maximum_age
+                    ):
+                        if self._wall_navigation_ready:
+                            self.stale_wall_stops += 1
+                        self._wall_navigation_ready = False
                 else:
                     walls, bushes = self.process_tile_data(tile_data)
                     self.time_since_walls_checked = current_time
@@ -1369,6 +2311,7 @@ class Play:
                     data['wall'] = walls
                     self.last_bushes_data = bushes
                     data['bush'] = bushes
+                    self._wall_navigation_ready = True
                     self.wall_scene_gate.accept(wall_sample, current_time)
             else:
                 self.wall_cache_count += 1

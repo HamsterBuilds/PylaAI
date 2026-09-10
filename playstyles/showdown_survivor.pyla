@@ -1,39 +1,24 @@
 {"name": "Showdown Survivor", "description": "Follow teammates or try to get closer to the center when no enemies and avoids showdown gas", "brawlers": ["all"], "gamemodes": ["trio showdown"], "author": "Official", "date": "2026-07-04"}
 def no_enemy_movement():
     player_pos = get_entity_pos(player_data)
+    closest_teammate_coords, dist = find_closest_teammate(teammate_data, player_pos, walls)
+
+    if closest_teammate_coords:
+        if dist < TILE_SIZE * 0.65:
+            return (0.0, 0.0)
+        return (
+            closest_teammate_coords[0] - player_pos[0],
+            closest_teammate_coords[1] - player_pos[1],
+        )
+
     objective_movement = get_recent_objective_movement(player_pos)
     if objective_movement:
         return objective_movement
 
-    closest_teammate_coords, dist = find_closest_teammate(teammate_data, player_pos, walls)
-
-    if not closest_teammate_coords:
-        # Calculate vector to the center of the screen
-        center_x = 1920*width_ratio / 2
-        center_y = 1080*height_ratio / 2
-
-        dx = center_x - player_pos[0]
-        dy = center_y - player_pos[1]
-        dist_to_center = math.hypot(dx, dy)
-
-        # Holding a stable position is better than choosing a new random
-        # direction every inference cycle.
-        if dist_to_center < TILE_SIZE * 2:
-            return (0.0, 0.0)
-
-        if dist_to_center > 0:
-            direction_x, direction_y = dx, dy
-        else:
-            direction_x, direction_y = 0.0, 0.0
-
-        return (direction_x, direction_y)
-    if dist < TILE_SIZE * 0.65:
-        return (0.0, 0.0)
-
-    dx = closest_teammate_coords[0] - player_pos[0]
-    dy = closest_teammate_coords[1] - player_pos[1]
-
-    return (dx, dy)
+    # The camera follows the player, so screen centre is not map centre. The
+    # central explorer retains a stable heading and refines it from gas-edge
+    # evidence; A* handles obstacles without changing the strategic goal.
+    return get_exploration_movement(player_data, walls)
 
 def avoid_poison_gas():
     opposite_direction = {"up": JOYSTICK_RADIUS, "down": -JOYSTICK_RADIUS, "left": JOYSTICK_RADIUS, "right": -JOYSTICK_RADIUS}
@@ -80,17 +65,29 @@ else:
         # Refresh the active objective while it is visible. If the target or
         # box disappears, continue to its last position before regrouping.
         remember_objective(enemy_coords)
+        attack_hittable = is_enemy_hittable(
+            player_pos, enemy_coords, walls, "attack"
+        )
+        super_hittable = (
+            is_super_ready
+            and is_enemy_hittable(
+                player_pos, enemy_coords, walls, "super"
+            )
+        )
+        enemy_actionable = attack_hittable or super_hittable
         if not anti_poison_gas_movement:
-            direction_x = enemy_coords[0] - player_pos[0]
-            direction_y = enemy_coords[1] - player_pos[1]
-
-            # Aggressive priority: always close the distance to the active
-            # enemy/box. The central navigator finds the shortest valid path.
-            movement = (direction_x, direction_y)
+            if enemy_actionable:
+                direction_x = enemy_coords[0] - player_pos[0]
+                direction_y = enemy_coords[1] - player_pos[1]
+                movement = (direction_x, direction_y)
+            else:
+                # A wall-blocked enemy is not an immediate task. Regroup with
+                # one stable teammate instead of indecisively circling terrain.
+                movement = no_enemy_movement()
 
         if is_super_ready and persistent_data["time_since_holding_attack"] is None:
             super_type = brawler_info['super_type']
-            enemy_hittable = is_enemy_hittable(player_pos, enemy_coords, walls, "super")
+            enemy_hittable = super_hittable
 
             if (enemy_hittable and
                     (enemy_distance <= super_range
@@ -104,7 +101,7 @@ else:
 
         # Attack if enemy is within attack range and hittable
         if enemy_distance <= attack_range:
-            enemy_hittable = is_enemy_hittable(player_pos, enemy_coords, walls, "attack")
+            enemy_hittable = attack_hittable
             if enemy_hittable:
                 # If the target disappears after this shot (especially a
                 # power-cube box), keep walking to its last position instead

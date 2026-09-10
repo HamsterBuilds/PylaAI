@@ -2,8 +2,8 @@ import os
 import time
 
 import cv2
+import numpy as np
 from utils import (
-    count_hsv_pixels,
     load_toml_as_dict, config_bool, load_brawlers_info,
     normalize_brawler_filename,
 )
@@ -19,19 +19,51 @@ class LobbyAutomation:
         self.window_controller = window_controller
         self.verbose_debug = config_bool(load_toml_as_dict("cfg/debug_settings.toml").get('verbose_debug'), False)
         self.idle_disconnect_hsv_high_bounds = load_toml_as_dict("cfg/lobby_config.toml").get("hsv_bounds", {}).get("idle_reconnect_high_bounds", [[10, 22, 42], [10, 22, 90], [118, 66, 46]])
+        self._idle_crop_scale = None
+        self._idle_crop_coordinates = None
+        self._idle_buffer_shape = None
+        self._idle_hsv_buffer = None
+        self._idle_mask_buffer = None
 
     def check_for_idle(self, frame):
         wr = self.window_controller.width_ratio
         hr = self.window_controller.height_ratio
-        x_start, x_end = int(460 * wr), int(1460 * wr)
-        y_start, y_end = int(400 * hr), int(675 * hr)
+        scale = (wr, hr)
+        if scale != self._idle_crop_scale:
+            self._idle_crop_scale = scale
+            self._idle_crop_coordinates = (
+                int(460 * wr), int(1460 * wr),
+                int(400 * hr), int(675 * hr),
+            )
+        x_start, x_end, y_start, y_end = self._idle_crop_coordinates
+        idle_crop = frame[y_start:y_end, x_start:x_end]
+        if idle_crop.size == 0:
+            self.window_controller.reset_to_default_resolution()
+            return
+        crop_shape = idle_crop.shape
+        if crop_shape != self._idle_buffer_shape:
+            self._idle_buffer_shape = crop_shape
+            self._idle_hsv_buffer = np.empty(crop_shape, dtype=np.uint8)
+            self._idle_mask_buffer = np.empty(crop_shape[:2], dtype=np.uint8)
+        try:
+            hsv_crop = cv2.cvtColor(
+                idle_crop, cv2.COLOR_RGB2HSV, dst=self._idle_hsv_buffer
+            )
+        except cv2.error as error:
+            print(f"Idle detection color conversion failed: {error}")
+            self.window_controller.reset_to_default_resolution()
+            return
         if self.verbose_debug:
             print(f"gray pixels (if > {self.gray_pixels_treshold} then bot will try to unidle)")
         for idle_disconnect_hsv_high_bound in self.idle_disconnect_hsv_high_bounds:
-            gray_pixels = count_hsv_pixels(frame[y_start:y_end, x_start:x_end], (0, 0, 0), tuple(idle_disconnect_hsv_high_bound), self.window_controller)
+            mask = cv2.inRange(
+                hsv_crop, (0, 0, 0), tuple(idle_disconnect_hsv_high_bound),
+                dst=self._idle_mask_buffer,
+            )
+            gray_pixels = cv2.countNonZero(mask)
             if self.verbose_debug:
                 try:
-                    cv2.imwrite(f"./debug_frames/idle_detection_{gray_pixels}_{len(os.listdir('./debug_frames'))}.png", cv2.cvtColor(frame[y_start:y_end, x_start:x_end], cv2.COLOR_BGR2RGB))
+                    cv2.imwrite(f"./debug_frames/idle_detection_{gray_pixels}_{len(os.listdir('./debug_frames'))}.png", cv2.cvtColor(idle_crop, cv2.COLOR_BGR2RGB))
                 except Exception:
                     pass
             if gray_pixels > self.gray_pixels_treshold:

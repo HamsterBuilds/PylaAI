@@ -15,23 +15,32 @@ class _Track:
     missed: int = 0
 
 
-def _iou(first, second):
+def _box_metrics(box):
+    width = box[2] - box[0]
+    height = box[3] - box[1]
+    return (
+        max(0.0, width) * max(0.0, height),
+        (box[0] + box[2]) * 0.5,
+        (box[1] + box[3]) * 0.5,
+        width,
+        height,
+    )
+
+
+def _iou(first, second, first_metrics, second_metrics):
     x1 = max(first[0], second[0])
     y1 = max(first[1], second[1])
     x2 = min(first[2], second[2])
     y2 = min(first[3], second[3])
     intersection = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-    first_area = max(0.0, first[2] - first[0]) * max(0.0, first[3] - first[1])
-    second_area = max(0.0, second[2] - second[0]) * max(0.0, second[3] - second[1])
+    first_area = first_metrics[0]
+    second_area = second_metrics[0]
     return intersection / max(first_area + second_area - intersection, 1.0)
 
 
-def _center_distance_sq(first, second):
-    first_x = (first[0] + first[2]) * 0.5
-    first_y = (first[1] + first[3]) * 0.5
-    second_x = (second[0] + second[2]) * 0.5
-    second_y = (second[1] + second[3]) * 0.5
-    dx, dy = first_x - second_x, first_y - second_y
+def _center_distance_sq(first_metrics, second_metrics):
+    dx = first_metrics[1] - second_metrics[1]
+    dy = first_metrics[2] - second_metrics[2]
     return dx * dx + dy * dy
 
 
@@ -49,6 +58,7 @@ class DetectionStabilizer:
         self.max_tracks = max(1, int(max_tracks))
         self.prediction = min(max(float(prediction), 0.0), 0.75)
         self.velocity_smoothing = min(max(float(velocity_smoothing), 0.0), 1.0)
+        self._velocity_remainder = 1.0 - self.velocity_smoothing
         self._tracks = {name: [] for name in self._MAX_MISSES}
         self._fresh = {name: False for name in self._MAX_MISSES}
 
@@ -59,31 +69,38 @@ class DetectionStabilizer:
             self._fresh[name] = False
 
     @staticmethod
-    def _match_score(track_box, detection):
-        overlap = _iou(track_box, detection)
+    def _match_score(track_box, detection, track_metrics, detection_metrics):
+        overlap = _iou(
+            track_box, detection, track_metrics, detection_metrics
+        )
         if overlap >= 0.15:
             return 2.0 + overlap
-        width = max(track_box[2] - track_box[0], detection[2] - detection[0], 1.0)
-        height = max(track_box[3] - track_box[1], detection[3] - detection[1], 1.0)
+        width = max(track_metrics[3], detection_metrics[3], 1.0)
+        height = max(track_metrics[4], detection_metrics[4], 1.0)
         distance_limit = max(width, height) * 1.25
-        distance_sq = _center_distance_sq(track_box, detection)
+        distance_sq = _center_distance_sq(track_metrics, detection_metrics)
         if distance_sq <= distance_limit * distance_limit:
             return 1.0 - math.sqrt(distance_sq) / distance_limit
         return None
 
     def _update_class(self, name, detections):
         tracks = self._tracks[name]
+        track_metrics = [_box_metrics(track.box) for track in tracks]
         matched = [False] * len(tracks)
         updated = []
 
         for raw_box in detections[:self.max_tracks]:
             box = [float(value) for value in raw_box[:4]]
+            box_metrics = _box_metrics(box)
             index = None
             best_score = -1.0
             for candidate_index, candidate in enumerate(tracks):
                 if matched[candidate_index]:
                     continue
-                score = self._match_score(candidate.box, box)
+                score = self._match_score(
+                    candidate.box, box,
+                    track_metrics[candidate_index], box_metrics,
+                )
                 if score is not None and score > best_score:
                     index = candidate_index
                     best_score = score
@@ -93,12 +110,13 @@ class DetectionStabilizer:
                 previous = track.box
                 alpha = self.smoothing
                 velocity_alpha = self.velocity_smoothing
+                velocity_remainder = self._velocity_remainder
                 if track.velocity is None:
                     track.velocity = [0.0, 0.0, 0.0, 0.0]
                 for coordinate in range(4):
                     delta = box[coordinate] - previous[coordinate]
                     track.velocity[coordinate] = (
-                        track.velocity[coordinate] * (1.0 - velocity_alpha)
+                        track.velocity[coordinate] * velocity_remainder
                         + delta * velocity_alpha
                     )
                     previous[coordinate] += delta * alpha
@@ -147,19 +165,33 @@ class SceneChangeGate:
             self.maximum_age, max(0.0, float(minimum_age))
         )
         self.sample_size = tuple(int(max(8, value)) for value in sample_size)
-        self._accepted_sample = None
         self._accepted_at = 0.0
+        self._reduced_buffer = np.empty(
+            (self.sample_size[1], self.sample_size[0], 3), dtype=np.uint8
+        )
+        self._candidate_buffer = np.empty(
+            (self.sample_size[1], self.sample_size[0]), dtype=np.uint8
+        )
+        self._accepted_sample = np.empty_like(self._candidate_buffer)
+        self._has_accepted_sample = False
+        self._difference_buffer = np.empty_like(self._candidate_buffer)
 
     def reset(self):
-        self._accepted_sample = None
+        self._has_accepted_sample = False
         self._accepted_at = 0.0
 
     def sample(self, frame):
-        reduced = cv2.resize(frame, self.sample_size, interpolation=cv2.INTER_AREA)
-        return cv2.cvtColor(reduced, cv2.COLOR_RGB2GRAY)
+        cv2.resize(
+            frame, self.sample_size, dst=self._reduced_buffer,
+            interpolation=cv2.INTER_AREA
+        )
+        return cv2.cvtColor(
+            self._reduced_buffer, cv2.COLOR_RGB2GRAY,
+            dst=self._candidate_buffer
+        )
 
     def should_refresh(self, frame, now):
-        if self._accepted_sample is None:
+        if not self._has_accepted_sample:
             candidate = self.sample(frame)
             return True, candidate
         age = now - self._accepted_at
@@ -168,11 +200,14 @@ class SceneChangeGate:
         candidate = self.sample(frame)
         if age >= self.maximum_age:
             return True, candidate
-        difference = cv2.absdiff(candidate, self._accepted_sample)
+        difference = cv2.absdiff(
+            candidate, self._accepted_sample, dst=self._difference_buffer
+        )
         return float(np.mean(difference)) >= self.threshold, candidate
 
     def accept(self, sample, now):
-        self._accepted_sample = sample
+        np.copyto(self._accepted_sample, sample)
+        self._has_accepted_sample = True
         self._accepted_at = now
 
 

@@ -91,10 +91,21 @@ api_base_url = cfg_api_base_url if cfg_api_base_url != "default" else default_ap
 brawlers_info_file_path = PROJECT_ROOT / "cfg" / "brawlers_info.json"
 
 
-def count_hsv_pixels(cv_image, low_hsv, high_hsv, window_controller=None):
+def count_hsv_pixels(cv_image, low_hsv, high_hsv, window_controller=None,
+                     hsv_buffer=None, mask_buffer=None):
     try:
-        hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_RGB2HSV)
-        mask = cv2.inRange(hsv_image, low_hsv, high_hsv)
+        if hsv_buffer is None:
+            hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_RGB2HSV)
+        else:
+            hsv_image = cv2.cvtColor(
+                cv_image, cv2.COLOR_RGB2HSV, dst=hsv_buffer
+            )
+        if mask_buffer is None:
+            mask = cv2.inRange(hsv_image, low_hsv, high_hsv)
+        else:
+            mask = cv2.inRange(
+                hsv_image, low_hsv, high_hsv, dst=mask_buffer
+            )
         return cv2.countNonZero(mask)
     except cv2.error as e:
         print(f"[ERROR CATCHING] OpenCV error occurred in count_hsv_pixels: {e}")

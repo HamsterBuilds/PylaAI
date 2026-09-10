@@ -1,9 +1,13 @@
 import sys
 import time
 import cv2
+from concurrent.futures import ThreadPoolExecutor
 
-from state_finder import get_state, is_underdog
+from state_finder import (
+    find_lower_right_green_action, get_state, is_in_lobby, is_underdog,
+)
 from trophy_observer import TrophyObserver, MatchResult
+from trophy_ocr import read_trophies_from_screen
 from utils import find_template_center, load_toml_as_dict, notify_user, save_brawler_data
 
 def load_image(image_path, scale_factor):
@@ -30,8 +34,8 @@ class StageManager:
         self.play_again_on_win = load_toml_as_dict("./cfg/bot_config.toml")["play_again_on_win"] == "yes"
         self.window_controller = window_controller
         self.states = {
-            'shop': self.quit_shop,
-            'brawler_selection': self.quit_shop,
+            'shop': lambda: self.quit_shop('shop'),
+            'brawler_selection': lambda: self.quit_shop('brawler_selection'),
             'popup': self.close_pop_up,
             'match': lambda: 0,
             'match_making': lambda: 0,
@@ -41,14 +45,14 @@ class StageManager:
             'star_drop_demonic': lambda: self.click_star_drop("demonic"),
             'star_drop_starr_nova': lambda: self.click_star_drop("starr_nova"),
             'trophy_reward': lambda: self.window_controller.press("proceed"),
-            'prestige_milestone': lambda: self.window_controller.press("continue_or_equip"),
-            'end_draw': self.end_game,
-            'end_victory': self.end_game,
-            'end_defeat': self.end_game,
-            'end_trio_showdown_0': self.end_game,
-            'end_trio_showdown_1': self.end_game,
-            'end_trio_showdown_2': self.end_game,
-            'end_trio_showdown_3': self.end_game,
+            'prestige_milestone': self.click_prestige_continue,
+            'end_draw': lambda: self.end_game('end_draw'),
+            'end_victory': lambda: self.end_game('end_victory'),
+            'end_defeat': lambda: self.end_game('end_defeat'),
+            'end_trio_showdown_0': lambda: self.end_game('end_trio_showdown_0'),
+            'end_trio_showdown_1': lambda: self.end_game('end_trio_showdown_1'),
+            'end_trio_showdown_2': lambda: self.end_game('end_trio_showdown_2'),
+            'end_trio_showdown_3': lambda: self.end_game('end_trio_showdown_3'),
         }
         self.matches_since_last_webhook_ping = 0
         self.ping_every_x_match = load_toml_as_dict("cfg/webhook_config.toml")['ping_every_x_match']
@@ -56,6 +60,15 @@ class StageManager:
         self.ping_when_stuck = load_toml_as_dict("cfg/webhook_config.toml")["ping_when_stuck"]
         self.playstyle_info = playstyle_info
         self.get_latest_state = state_getting
+        self._trophy_ocr_executor = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="pyla-trophy-ocr"
+        )
+        self._pending_lobby_trophy_reads = None
+        self._pending_lobby_trophy_deadline = 0.0
+        self._last_completed_result = None
+        self._last_lobby_play_press = 0.0
+        self._last_end_handled_at = 0.0
+        self._last_end_handled_state = None
 
     def _should_stop(self):
         return bool(self.runtime_control and self.runtime_control.should_stop())
@@ -72,6 +85,112 @@ class StageManager:
                 return True
             time.sleep(min(poll_interval, max(end_time - time.time(), 0)))
         return False
+
+    def _start_lobby_trophy_scan(self, first_frame, first_frame_time=0.0,
+                                 result_filter=None):
+        """Read two distinct lobby frames without delaying the exit button."""
+        if self._pending_lobby_trophy_reads is not None:
+            return
+        expected = self.Trophy_observer.current_trophies
+        second_frame, _ = self.window_controller.wait_for_frame(
+            first_frame_time, timeout=0.25
+        )
+        if second_frame is None:
+            second_frame = first_frame
+        self._pending_lobby_trophy_reads = (
+            self._trophy_ocr_executor.submit(
+                read_trophies_from_screen, first_frame, expected, 120,
+                # The selected-brawler trophy/rank panel is on the left side
+                # of the lobby. The previous 12%-88% crop cut off that panel
+                # and mostly OCR'd unrelated centre-screen values.
+                result_filter, (0.0, 0.05, 0.82, 0.90)
+            ),
+            self._trophy_ocr_executor.submit(
+                read_trophies_from_screen, second_frame, expected, 120,
+                result_filter, (0.0, 0.05, 0.82, 0.90)
+            ),
+        )
+        self._pending_lobby_trophy_deadline = time.monotonic() + 6.5
+
+    def _finish_lobby_trophy_scan(self, wait=True):
+        futures = self._pending_lobby_trophy_reads
+        if futures is None:
+            return None
+        if not wait and not all(future.done() for future in futures):
+            return None
+        self._pending_lobby_trophy_reads = None
+        readings = []
+        for future in futures:
+            try:
+                remaining = max(
+                    0.0, self._pending_lobby_trophy_deadline - time.monotonic()
+                )
+                value = future.result(timeout=remaining)
+                if value is not None:
+                    readings.append(value)
+            except Exception as error:
+                future.cancel()
+                print(f"Lobby trophy OCR unavailable: {error}")
+        if len(readings) != 2 or readings[0] != readings[1]:
+            print("Lobby trophy OCR was not confirmed by two frames; total unchanged.")
+            return None
+
+        observed = readings[0]
+        current_brawler = self.brawlers_pick_data[0]
+        old_value = self.Trophy_observer.current_trophies
+        if observed != old_value:
+            print(f"Lobby corrected current trophies: {old_value} -> {observed}")
+            self.Trophy_observer.change_trophies(
+                observed, current_brawler['brawler']
+            )
+            current_brawler['trophies'] = observed
+            save_brawler_data(self.brawlers_pick_data)
+        # The result-direction constraint belongs only to the round that just
+        # ended. Once a lobby total is confirmed, later scans are neutral.
+        self._last_completed_result = None
+        return observed
+
+    def _scan_selected_brawler_trophies(self):
+        """Synchronize Pyla immediately after a brawler selection returns."""
+        # Brawler selection returns as soon as its final click has completed.
+        # Wait for the lobby to actually render the newly selected brawler;
+        # otherwise OCR can read the closing selection screen or an old frame.
+        settle_deadline = time.monotonic() + 3.0
+        frame = None
+        frame_time = 0.0
+        while time.monotonic() < settle_deadline:
+            if self._should_stop() or self._should_pause():
+                return None
+            candidate, candidate_time = self.window_controller.screenshot(
+                with_timestamp=True
+            )
+            if is_in_lobby(candidate):
+                frame = candidate
+                frame_time = candidate_time
+                break
+            if self._sleep_interruptible(0.1):
+                return None
+        if frame is None:
+            print("Selected-brawler trophy OCR skipped: lobby did not settle.")
+            return None
+
+        # Allow the brawler name/rank panel to finish its entrance animation,
+        # then require the OCR frames to be newer than the settled lobby frame.
+        if self._sleep_interruptible(0.3):
+            return None
+        frame, frame_time = self.window_controller.screenshot(
+            with_timestamp=True
+        )
+        if self._pending_lobby_trophy_reads is not None:
+            for future in self._pending_lobby_trophy_reads:
+                future.cancel()
+            self._pending_lobby_trophy_reads = None
+        self._start_lobby_trophy_scan(frame, frame_time)
+        return self._finish_lobby_trophy_scan(wait=True)
+
+    def sync_selected_brawler_trophies(self):
+        """Public selection hook used by the initial and later queue picks."""
+        return self._scan_selected_brawler_trophies()
 
     @staticmethod
     def validate_trophies(trophies_string):
@@ -90,15 +209,44 @@ class StageManager:
         if self._should_stop() or self._should_pause():
             return
 
+        # State actions are intentionally checked often for fast navigation.
+        # Do not fire the same coordinate repeatedly while the Play animation
+        # is transitioning away from the lobby.
+        now = time.monotonic()
+        if now - self._last_lobby_play_press < 1.0:
+            return
+
+        lobby_frame, lobby_frame_time = self.window_controller.screenshot(
+            with_timestamp=True
+        )
+        if not is_in_lobby(lobby_frame):
+            print("Skipping stale lobby action: current frame is not lobby.")
+            return
+
         print("state is lobby, starting game")
+        # A post-match lobby scan updates the same queue file served by the
+        # local Pyla API before target/ready decisions use the value.
+        if self._pending_lobby_trophy_reads is None:
+            self._start_lobby_trophy_scan(
+                lobby_frame, lobby_frame_time, self._last_completed_result
+            )
+        # Accuracy takes priority here: both lobby frames must be processed
+        # before Play can leave the screen, including the initial app launch.
+        observed_trophies = self._finish_lobby_trophy_scan(wait=True)
+        if observed_trophies is None:
+            print(
+                "Lobby trophy OCR failed; keeping the current total and "
+                "continuing to Play."
+            )
+        current_entry = self.brawlers_pick_data[0]
+        type_of_push = current_entry['type']
+        push_current_brawler_till = current_entry['push_until']
         values = {
             "trophies": self.Trophy_observer.current_trophies,
             "wins": self.Trophy_observer.current_wins
         }
 
-        type_of_push = self.brawlers_pick_data[0]['type']
         value = values[type_of_push]
-        push_current_brawler_till = self.brawlers_pick_data[0]['push_until']
 
         if value >= push_current_brawler_till:
             if len(self.brawlers_pick_data) <= 1:
@@ -141,6 +289,7 @@ class StageManager:
                     self.brawlers_pick_data[0]['trophies'] = confirmed
                     self.Trophy_observer.current_wins = self.brawlers_pick_data[0]['wins'] if self.brawlers_pick_data[0]['wins'] != "" else 0
                     self.Trophy_observer.win_streak = self.brawlers_pick_data[0]['win_streak']
+                    self._scan_selected_brawler_trophies()
             else:
                 confirmed = self.Trophy_observer.select_brawler(
                     self.brawlers_pick_data[0]['brawler'],
@@ -149,6 +298,7 @@ class StageManager:
                 self.brawlers_pick_data[0]['trophies'] = confirmed
                 self.Trophy_observer.current_wins = self.brawlers_pick_data[0]['wins'] if self.brawlers_pick_data[0]['wins'] != "" else 0
                 self.Trophy_observer.win_streak = self.brawlers_pick_data[0]['win_streak']
+                self._scan_selected_brawler_trophies()
                 print("Next brawler is in manual mode, waiting 10 seconds to let user switch.")
                 if self._sleep_interruptible(10):
                     return
@@ -161,10 +311,16 @@ class StageManager:
 
         if self._should_stop() or self._should_pause():
             return
+        # OCR and queue updates can take several seconds on a low-end CPU.
+        # Never trust the pre-OCR lobby frame when choosing where to click.
+        if not is_in_lobby(self.window_controller.screenshot()):
+            print("Lobby changed during trophy OCR; skipping stale Play press.")
+            return
         self.window_controller.release_movement()
         self.window_controller.press("proceed")
-        print("Pressed to start a match")
-        time.sleep(2)
+        self._last_lobby_play_press = time.monotonic()
+        print("Pressed lobby Play button")
+        self._sleep_interruptible(0.25)
 
     def click_star_drop(self, drop_type="regular"):
         if hasattr(self, '_star_drop_thread') and self._star_drop_thread.is_alive():
@@ -182,49 +338,103 @@ class StageManager:
         self._star_drop_thread = threading.Thread(target=_handle_drop, daemon=True)
         self._star_drop_thread.start()
 
-    def end_game(self):
+    def click_prestige_continue(self):
         screenshot = self.window_controller.screenshot()
+        button_center = find_lower_right_green_action(screenshot)
+        if button_center is not None:
+            print("Prestige reward detected, pressing LET'S GO.")
+            self.window_controller.click(*button_center)
+        else:
+            # Compatibility with the older centred CONTINUE/EQUIP screen.
+            self.window_controller.press("continue_or_equip")
 
-        current_state = get_state(screenshot)
-        button_pressed = False
+    def end_game(self, detected_state=None):
+        screenshot = self.window_controller.screenshot()
+        current_state = detected_state or get_state(screenshot)
         end_screen_time = time.time()
-        parsed_result = None
-        while current_state.startswith("end") and time.time() - end_screen_time < 35:
+        if not current_state.startswith("end"):
+            return
+        now = time.monotonic()
+        if (
+            current_state == self._last_end_handled_state
+            and now - self._last_end_handled_at < 20.0
+        ):
+            print("Ignoring duplicate end-screen action for the same round.")
+            return
+        self._last_end_handled_state = current_state
+        self._last_end_handled_at = now
 
-            if time.time() - self.time_since_last_stat_change > 25 and parsed_result is None :
-                raw_found_result = '_'.join(current_state.split("_")[1:])
-                parsed_result = self.Trophy_observer.parse_game_result(raw_found_result)
+        # The state transition itself guarantees this is a new result screen;
+        # the old 25-second guard delayed short rounds and could skip play-again.
+        raw_found_result = '_'.join(current_state.split("_")[1:])
+        parsed_result = self.Trophy_observer.parse_game_result(raw_found_result)
+        self._last_completed_result = parsed_result.result.value
+        current_brawler = self.brawlers_pick_data[0]['brawler']
+        underdog = is_underdog(screenshot)
+        if underdog:
+            print("Underdog detected for this match.")
 
-                current_brawler = self.brawlers_pick_data[0]['brawler']
-                power_level = None
-                underdog = is_underdog(screenshot)
-                if underdog:
-                    print("Underdog detected for this match.")
-                self.Trophy_observer.add_trophies(parsed_result, current_brawler, self.playstyle_info, underdog, power_level)
-                self.Trophy_observer.add_win(parsed_result)
-                self.time_since_last_stat_change = time.time()
-                values = {
-                    "trophies": self.Trophy_observer.current_trophies,
-                    "wins": self.Trophy_observer.current_wins
-                }
-                type_to_push = self.brawlers_pick_data[0]['type']
-                value = values[type_to_push]
-                self.brawlers_pick_data[0][type_to_push] = value
-                self.brawlers_pick_data[0]['win_streak'] = self.Trophy_observer.win_streak
-                save_brawler_data(self.brawlers_pick_data)
+        # This result screen shows rank/player statistics, not the selected
+        # brawler's total. Reading a total here produced false candidates or
+        # guaranteed failure. The first stable lobby frame is authoritative.
+        use_play_again = (
+            self.play_again_on_win
+            and parsed_result.result == MatchResult.VICTORY
+            and not self._should_pause()
+            and not self._should_stop()
+        )
+        button_name = "play_again" if use_play_again else "proceed"
+        print("Game has ended, pressing", button_name)
+        self.window_controller.press(button_name)
+        last_button_press = time.monotonic()
 
-            if not button_pressed and self.play_again_on_win and parsed_result and parsed_result.result == MatchResult.VICTORY and not self._should_pause() and not self._should_stop():
-                self.window_controller.press("play_again")
-                button_pressed = True
-            elif not button_pressed:
-                print("Game has ended, proceeding")
-                self.window_controller.press("proceed")
+        while current_state.startswith("end") and time.time() - end_screen_time < 20:
+            if self._should_stop() or self._should_pause():
+                return
+            if self._sleep_interruptible(0.25):
+                return
+            screenshot, screenshot_time = self.window_controller.screenshot(
+                with_timestamp=True
+            )
+            current_state = get_state(screenshot, previous_state=current_state)
+            if time.monotonic() - last_button_press >= 1.5:
+                # Never repeat this coordinate based on sticky state alone:
+                # on the lobby the same position is the Play button and would
+                # skip the authoritative post-match trophy scan.
+                raw_state = get_state(screenshot, previous_state=None)
+                if raw_state.startswith("end"):
+                    self.window_controller.press(button_name)
+                    last_button_press = time.monotonic()
+                else:
+                    current_state = raw_state
 
-            time.sleep(3)
-            screenshot = self.window_controller.screenshot()
-            current_state = get_state(screenshot)
+        self.Trophy_observer.add_trophies(
+            parsed_result,
+            current_brawler,
+            self.playstyle_info,
+            underdog,
+            power_level=None,
+            observed_trophies=None,
+            calculate_when_missing=False,
+        )
+        self.Trophy_observer.add_win(parsed_result)
+        self.time_since_last_stat_change = time.time()
+        values = {
+            "trophies": self.Trophy_observer.current_trophies,
+            "wins": self.Trophy_observer.current_wins,
+        }
+        type_to_push = self.brawlers_pick_data[0]['type']
+        self.brawlers_pick_data[0][type_to_push] = values[type_to_push]
+        self.brawlers_pick_data[0]['win_streak'] = self.Trophy_observer.win_streak
+        save_brawler_data(self.brawlers_pick_data)
 
-        if self.play_again_on_win and parsed_result and parsed_result.result == MatchResult.VICTORY and not self._should_pause():
+        if current_state == "lobby" and not use_play_again:
+            self._last_lobby_play_press = 0.0
+            self._start_lobby_trophy_scan(
+                screenshot, screenshot_time, self._last_completed_result
+            )
+
+        if use_play_again:
             print("Waiting for match to start...")
             start_wait_time = time.time()
             interrupted = False
@@ -247,12 +457,26 @@ class StageManager:
             print("Match did not start within 25s, restarting the game.")
             self.window_controller.restart_brawl_stars()
             time.sleep(2)
-        elif time.time() - end_screen_time > 35:
+        elif time.time() - end_screen_time > 20:
             print("End screen timeout reached, restarting the game.")
             self.window_controller.restart_brawl_stars()
         print("Game has ended", current_state)
 
-    def quit_shop(self):
+    def quit_shop(self, expected_state=None):
+        if expected_state is not None:
+            screenshot = self.window_controller.screenshot()
+            # This coordinate is the back arrow in menus but the profile area
+            # in the lobby, so lobby detection always has veto priority.
+            if is_in_lobby(screenshot):
+                print(f"Skipping stale {expected_state} action on lobby screen.")
+                return
+            fresh_state = get_state(screenshot, previous_state=expected_state)
+            if fresh_state != expected_state:
+                print(
+                    f"Skipping stale {expected_state} back-button action; "
+                    f"screen is now {fresh_state}."
+                )
+                return
         self.window_controller.click(100 * self.window_controller.width_ratio, 60 * self.window_controller.height_ratio)
         time.sleep(1)
 
