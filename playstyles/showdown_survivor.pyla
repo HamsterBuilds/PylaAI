@@ -1,61 +1,97 @@
 {"name": "Showdown Survivor", "description": "Follow teammates or try to get closer to the center when no enemies and avoids showdown gas", "brawlers": ["all"], "gamemodes": ["trio showdown"], "author": "Official", "date": "2026-07-04"}
 def no_enemy_movement():
-    player_pos = get_entity_pos(player_data)
+    persistent_data["combat_mode"] = None
+    player_pos = get_player_position(player_data)
+    # Finish the last visible enemy/box objective before regrouping. This is
+    # what makes the bot actually collect the cube after destroying a box.
+    objective_movement = get_recent_objective_movement(player_pos)
+    if objective_movement:
+        persistent_data["navigation_goal"] = "objective"
+        return objective_movement
+
     closest_teammate_coords, dist = find_closest_teammate(teammate_data, player_pos, walls)
 
     if closest_teammate_coords:
-        if dist < TILE_SIZE * 0.65:
-            return (0.0, 0.0)
+        if dist < TILE_SIZE * 1.05:
+            # Staying close is still an active goal. Continue through the
+            # teammate's heading instead of releasing the joystick and then
+            # repeatedly reacquiring the same target.
+            persistent_data["navigation_goal"] = "teammate_formation"
+            return get_teammate_formation_movement(
+                player_data, player_pos, closest_teammate_coords, walls
+            )
+        persistent_data["navigation_goal"] = "teammate"
         return (
             closest_teammate_coords[0] - player_pos[0],
             closest_teammate_coords[1] - player_pos[1],
         )
 
-    objective_movement = get_recent_objective_movement(player_pos)
-    if objective_movement:
-        return objective_movement
-
     # The camera follows the player, so screen centre is not map centre. The
     # central explorer retains a stable heading and refines it from gas-edge
     # evidence; A* handles obstacles without changing the strategic goal.
-    return get_exploration_movement(player_data, walls)
+    persistent_data["navigation_goal"] = "teammate_search"
+    return get_teammate_search_movement(player_data, walls)
 
 def avoid_poison_gas():
-    opposite_direction = {"up": JOYSTICK_RADIUS, "down": -JOYSTICK_RADIUS, "left": JOYSTICK_RADIUS, "right": -JOYSTICK_RADIUS}
     poison_gas = is_there_poison_gas(player_data)
-    x, y = 0, 0
-    if poison_gas["up"] or poison_gas["down"]:
-        if poison_gas["up"] > poison_gas["down"]:
-            y = opposite_direction["up"]
-        else:
-            y = opposite_direction["down"]
-    if poison_gas["left"] or poison_gas["right"]:
-        if poison_gas["left"] > poison_gas["right"]:
-            x = opposite_direction["left"]
-        else:
-            x = opposite_direction["right"]
+    highest = max(
+        poison_gas["up"], poison_gas["down"],
+        poison_gas["left"], poison_gas["right"],
+    )
+    if highest <= 0:
+        persistent_data["poison_heading"] = None
+        return None
 
-    return (x, y) if x != 0 or y != 0 else None
+    # Move proportionally away from gas instead of independently snapping
+    # each axis to +/- joystick maximum. Equal opposite-side readings contain
+    # no directional information and must not manufacture an arbitrary turn.
+    x = poison_gas["left"] - poison_gas["right"]
+    y = poison_gas["up"] - poison_gas["down"]
+    if x * x + y * y < (highest * 0.12) * (highest * 0.12):
+        persistent_data["poison_heading"] = None
+        return None
+    proposed = normalize_move(x, y)
+    previous = persistent_data.get("poison_heading")
+    if previous:
+        proposed = normalize_move(
+            previous[0] * 0.45 + proposed[0] * 0.55,
+            previous[1] * 0.45 + proposed[1] * 0.55,
+        )
+    persistent_data["poison_heading"] = proposed
+    return proposed
 
 brawler_info = brawlers_info.get(brawler)
 if not brawler_info:
     raise ValueError(f"Brawler '{brawler}' not found in brawlers info.")
 must_hold_attack = must_brawler_hold_attack(brawler, brawlers_info)
-# if a brawler has been holding an attack for its max duration + the bot setting, then we release
+# Mark a fully charged shot as ready, but do not release it before this
+# frame's target and wall geometry have been validated.
 if must_hold_attack and persistent_data["time_since_holding_attack"] is not None and time.time() - persistent_data["time_since_holding_attack"] >= brawler_info['hold_attack'] + seconds_to_hold_attack_after_reaching_max:
-    attack(touch_up=True, touch_down=False)
-    persistent_data["time_since_holding_attack"] = None
+    persistent_data["charged_attack_ready"] = True
 
 safe_range, attack_range, super_range = get_brawler_range(brawler)
-player_pos = get_entity_pos(player_data)
+player_pos = get_player_position(player_data)
 #if debug: print("found player pos:", player_pos)
 anti_poison_gas_movement = avoid_poison_gas()
 if anti_poison_gas_movement:
+    persistent_data["navigation_goal"] = "poison"
     movement = anti_poison_gas_movement
-if not is_there_enemy(enemy_data):
+cube_coords, cube_distance = find_closest_power_cube(
+    power_cube_data, player_pos, walls
+)
+if cube_coords and not anti_poison_gas_movement:
+    # A dropped cube is guaranteed value and disappears when collected. It
+    # outranks boxes, enemies and formation-following while visible.
+    persistent_data["navigation_goal"] = "power_cube"
+    persistent_data["combat_mode"] = None
+    movement = (
+        cube_coords[0] - player_pos[0],
+        cube_coords[1] - player_pos[1],
+    )
+elif not is_there_enemy(enemy_data):
     if not anti_poison_gas_movement:
         movement = no_enemy_movement()
-else:
+elif not anti_poison_gas_movement:
     enemy_coords, enemy_distance = find_closest_enemy(enemy_data, player_pos, walls, "attack")
     if enemy_coords is None:
         if not anti_poison_gas_movement:
@@ -74,16 +110,39 @@ else:
                 player_pos, enemy_coords, walls, "super"
             )
         )
-        enemy_actionable = attack_hittable or super_hittable
         if not anti_poison_gas_movement:
-            if enemy_actionable:
-                direction_x = enemy_coords[0] - player_pos[0]
-                direction_y = enemy_coords[1] - player_pos[1]
+            direction_x = enemy_coords[0] - player_pos[0]
+            direction_y = enemy_coords[1] - player_pos[1]
+            previous_combat_mode = persistent_data.get("combat_mode")
+            if (
+                not attack_hittable
+                or safe_range <= 0
+                or enemy_distance > safe_range * (
+                    0.98 if previous_combat_mode == "approach" else 1.08
+                )
+            ):
+                # A blocked target remains an approach goal so A* can find a
+                # route to line of sight instead of abandoning the fight.
+                persistent_data["navigation_goal"] = "enemy_approach"
+                persistent_data["combat_mode"] = "approach"
                 movement = (direction_x, direction_y)
+            elif enemy_distance < safe_range * (
+                0.82 if previous_combat_mode == "retreat" else 0.72
+            ):
+                # Create brawler-specific spacing without bypassing central
+                # wall/water navigation.
+                persistent_data["navigation_goal"] = "enemy_retreat"
+                persistent_data["combat_mode"] = "retreat"
+                movement = (-direction_x, -direction_y)
             else:
-                # A wall-blocked enemy is not an immediate task. Regroup with
-                # one stable teammate instead of indecisively circling terrain.
-                movement = no_enemy_movement()
+                # Keep changing the firing angle like a human player. A
+                # deliberate lateral lane is safer and more useful than
+                # releasing movement in the middle of combat.
+                persistent_data["navigation_goal"] = "enemy_strafe"
+                persistent_data["combat_mode"] = "strafe"
+                movement = get_combat_strafe_movement(
+                    player_data, player_pos, enemy_coords, walls
+                )
 
         if is_super_ready and persistent_data["time_since_holding_attack"] is None:
             super_type = brawler_info['super_type']
@@ -103,19 +162,24 @@ else:
         if enemy_distance <= attack_range:
             enemy_hittable = attack_hittable
             if enemy_hittable:
-                # If the target disappears after this shot (especially a
-                # power-cube box), keep walking to its last position instead
-                # of immediately switching back to teammate following.
-                remember_objective(enemy_coords)
                 if is_gadget_ready and persistent_data["time_since_holding_attack"] is None:
                     use_gadget()
 
-                if not must_hold_attack:
+                if (
+                    must_hold_attack
+                    and persistent_data.get("charged_attack_ready")
+                ):
+                    attack(touch_up=True, touch_down=False)
+                    persistent_data["time_since_holding_attack"] = None
+                    persistent_data["charged_attack_ready"] = False
+                elif not must_hold_attack:
                     attack()
                 else:
                     if persistent_data["time_since_holding_attack"] is None:
                         persistent_data["time_since_holding_attack"] = time.time()
+                        persistent_data["charged_attack_ready"] = False
                         attack(touch_up=False, touch_down=True)
                     elif time.time() - persistent_data["time_since_holding_attack"] >= brawlers_info[brawler]['hold_attack']:
                         attack(touch_up=True, touch_down=False)
                         persistent_data["time_since_holding_attack"] = None
+                        persistent_data["charged_attack_ready"] = False

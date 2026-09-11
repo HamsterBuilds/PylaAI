@@ -102,11 +102,15 @@ def must_brawler_hold_attack(brawler_name: str, brawlers_info_dict: Optional[Dic
     return False
 
 def get_entity_pos(entity: List[float]) -> Tuple[float, float]:
-    """Returns the center (x, y) coordinates of the player bounding box."""
+    """Returns the visual center (x, y) of an arbitrary detection box."""
+    return (0.0, 0.0)
+
+def get_player_position(player_box: List[float]) -> Tuple[float, float]:
+    """Returns the physical ground/hit-circle origin used by navigation."""
     return (0.0, 0.0)
 
 def get_actual_player_box(player_box: List[float]) -> List[float]:
-    """Returns the 106px hit-circle bounding box [x1, y1, x2, y2] derived from the detected player box."""
+    """Returns the configured navigation hit-circle box [x1, y1, x2, y2]."""
     return [0.0, 0.0, 0.0, 0.0]
 
 def get_distance(enemy_coords: Tuple[float, float], player_coords: Tuple[float, float]) -> float:

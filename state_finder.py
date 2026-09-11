@@ -335,16 +335,11 @@ def get_state(screenshot, previous_state=None):
             # Check lobby before generic green reward buttons: lobby Play is
             # also green and occupies the lower-right part of the screen.
             state = "lobby"
-        elif is_in_prestige_milestone(screenshot):
-            state = "prestige_milestone"
-        elif is_in_trophy_reward(screenshot):
-            state = "trophy_reward"
         else:
-            star_drop_type = is_in_star_drop(screenshot)
-            state = (
-                f"star_drop_{star_drop_type}"
-                if star_drop_type else "match"
-            )
+            # Reward templates contain bright shapes also seen in attacks,
+            # supers and map decorations. They cannot legitimately replace a
+            # live match before an end/lobby transition has been confirmed.
+            state = "match"
     elif previous_state == "lobby" and is_in_lobby(screenshot):
         state = "lobby"
     elif previous_state == "match_making" and is_in_match_making(screenshot):

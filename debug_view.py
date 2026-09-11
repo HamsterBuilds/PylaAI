@@ -506,6 +506,7 @@ def draw_debug_data(image, debug_data, width, height):
         draw_player_hit_circle(image, debug_data.get("player_hit_circle"))
     draw_boxes(image, debug_data.get("enemy"), (0, 0, 255))
     draw_boxes(image, debug_data.get("teammate"), (255, 0, 0))
+    draw_boxes(image, debug_data.get("power_cube"), (0, 255, 120), 4)
     if advanced_visuals:
         draw_lines(image, debug_data.get("enemy_los_lines") or debug_data.get("clear_los_lines"), (0, 0, 120), 7)
         draw_lines(image, debug_data.get("teammate_los_lines"), (255, 180, 0), 7)

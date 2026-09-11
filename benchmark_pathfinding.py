@@ -16,6 +16,13 @@ SCENARIOS = {
         (180, 320), (500, 320),
         [[240, 110, 290, 370], [380, 270, 430, 530]],
     ),
+    "long_water_strip": (
+        (320, 540), (320, 100), [[80, 280, 560, 350]],
+    ),
+    "narrow_gate": (
+        (120, 320), (530, 320),
+        [[290, 20, 350, 225], [290, 415, 350, 620]],
+    ),
 }
 
 
@@ -25,6 +32,14 @@ def distance(first, second):
 
 def route_length(points):
     return sum(distance(first, second) for first, second in zip(points, points[1:]))
+
+
+def complete_route(start, path, goal):
+    """Append the exact goal only when the planner did not already do so."""
+    points = [start, *path]
+    if not points or distance(points[-1], goal) >= 1e-6:
+        points.append(goal)
+    return points
 
 
 def direction_changes(points, threshold_degrees=12):
@@ -110,8 +125,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repetitions", type=int, default=500)
     args = parser.parse_args()
-    planner = LocalPathPlanner(area_size=640, cell_size=36, cache_seconds=0.25)
+    planner = LocalPathPlanner(
+        area_size=640, cell_size=36, cache_seconds=0.25, wall_padding=12
+    )
     radius = 53
+    required_clearance = radius + planner.wall_padding
     successful = 0
     legacy_successful = 0
     new_turns = 0
@@ -122,8 +140,10 @@ def main():
     for name, (start, goal, walls) in SCENARIOS.items():
         planner.reset()
         path = planner.plan(start, goal, walls, radius, time.monotonic(), (1, 0))
-        points = [start, *path, goal]
-        found = bool(path) and collision_free(points, walls, radius)
+        points = complete_route(start, path, goal)
+        found = bool(path) and collision_free(
+            points, walls, required_clearance
+        )
         legacy_points, legacy_found = legacy_greedy_route(start, goal, walls, radius)
         successful += int(found)
         legacy_successful += int(legacy_found)
@@ -152,6 +172,42 @@ def main():
         planner.raw_waypoints - planner.smoothed_waypoints
     ) / max(1, planner.raw_waypoints)
     hit_rate = planner.path_cache_hits / max(1, planner.plan_requests) * 100
+
+    # Force repeated replans while a detected wall jitters by a few pixels.
+    # The selected side should remain stable instead of alternating each tick.
+    jitter_planner = LocalPathPlanner(
+        area_size=640, cell_size=36, cache_seconds=0.25, wall_padding=12
+    )
+    jitter_start, jitter_goal = (180, 320), (470, 320)
+    jitter_signs = []
+    jitter_collision_free = True
+    preferred = (1.0, 0.0)
+    jitter_time = time.monotonic()
+    for index, jitter in enumerate((0, 4, -3, 5, -4, 2, -2, 3)):
+        jitter_walls = [[300 + jitter, 220, 350 + jitter, 420]]
+        jitter_path = jitter_planner.plan(
+            jitter_start, jitter_goal, jitter_walls, radius,
+            jitter_time + index * 0.3, preferred,
+        )
+        jitter_points = complete_route(
+            jitter_start, jitter_path, jitter_goal
+        )
+        jitter_collision_free &= bool(jitter_path) and collision_free(
+            jitter_points, jitter_walls,
+            radius + jitter_planner.wall_padding,
+        )
+        if jitter_path:
+            first_heading = (
+                jitter_path[0][0] - jitter_start[0],
+                jitter_path[0][1] - jitter_start[1],
+            )
+            preferred = first_heading
+            if abs(first_heading[1]) >= 1:
+                jitter_signs.append(1 if first_heading[1] > 0 else -1)
+    jitter_side_changes = sum(
+        first != second
+        for first, second in zip(jitter_signs, jitter_signs[1:])
+    )
     print("------------------------------------------------------------------------")
     print(f"Legacy route success: {legacy_success_rate:.1f}%")
     print(f"A* route success: {success_rate:.1f}%")
@@ -161,15 +217,22 @@ def main():
     print(f"A* routes found/failed: {planner.routes_found}/{planner.routes_failed}")
     print(f"Cached {args.repetitions} requests: {cached_ms:.2f} ms")
     print(f"A* cache hit rate: {hit_rate:.1f}%")
+    print(f"A* occupancy rebuilds: {planner.occupancy_rebuilds}")
+    print(f"Current blocked grid edges: {len(planner._blocked_edges)}")
+    print(f"Wall-jitter side changes: {jitter_side_changes}")
+    print(f"Wall-jitter routes collision-free: {jitter_collision_free}")
     path_target_met = (
         successful == len(SCENARIOS)
         and max(relative_success_gain, turn_reduction) >= 80.0
+        and jitter_collision_free
+        and jitter_side_changes == 0
     )
     print(
         "PATHFINDING TARGET: "
         + ("PASS" if path_target_met else "NOT YET")
         + " (requires collision-free success in every scenario and >=80% "
-          "improvement in route success or direction changes)"
+          "improvement in route success or direction changes, plus zero "
+          "wall-jitter side changes)"
     )
 
 

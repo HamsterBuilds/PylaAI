@@ -210,6 +210,11 @@ class SceneChangeGate:
         self._has_accepted_sample = True
         self._accepted_at = now
 
+    def request_refresh(self):
+        """Make the next eligible check refresh without sampling twice."""
+        if self._has_accepted_sample:
+            self._accepted_at = float("-inf")
+
 
 class StateConsensus:
     """Reject isolated state classifications without delaying stable states."""

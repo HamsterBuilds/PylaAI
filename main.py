@@ -170,6 +170,10 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
             print("Starting with queue data:", data)
             self.playstyle_info, pyla_code = load_pyla_script(current_playstyle)
             self.Play = Play(*self.load_models(), self.window_controller, pyla_code)
+            # Model warm-up takes several seconds on old CPUs. Start it while
+            # lobby/setup work is still happening so the first match frame
+            # never waits motionless for navigation to become available.
+            self.Play.preload_wall_model()
             self.Time_management = TimeManagement()
             self.lobby_automator = LobbyAutomation(self.window_controller)
             self.runtime_control = runtime_control
@@ -616,12 +620,48 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                     entity_total = self.entity_inference_count + self.entity_skip_count
                     wall_total = self.Play.wall_inference_count + self.Play.wall_cache_count
                     planner = self.Play.path_planner
+                    decision_total = max(1, self.Play.navigation_decisions)
+                    goal_switch_rate = (
+                        100.0 * self.Play.navigation_goal_switches
+                        / decision_total
+                    )
+                    idle_decision_rate = (
+                        100.0 * self.Play.navigation_idle_decisions
+                        / decision_total
+                    )
+                    routed_total = max(
+                        1,
+                        self.Play.direct_navigation_moves
+                        + self.Play.planned_navigation_moves,
+                    )
+                    direct_move_rate = (
+                        100.0 * self.Play.direct_navigation_moves
+                        / routed_total
+                    )
+                    goal_distribution = "/".join(
+                        f"{name}:{count}"
+                        for name, count in sorted(
+                            self.Play.navigation_goal_counts.items(),
+                            key=lambda item: (-item[1], item[0]),
+                        )[:5]
+                    ) or "none"
+                    route_failure_distribution = "/".join(
+                        f"{name}:{count}"
+                        for name, count in sorted(
+                            self.Play.route_failure_counts.items(),
+                            key=lambda item: (-item[1], item[0]),
+                        )[:4]
+                    ) or "none"
                     entity_saved = 100.0 * self.entity_skip_count / max(1, entity_total)
                     wall_saved = 100.0 * self.Play.wall_cache_count / max(1, wall_total)
                     path_saved = 100.0 * planner.path_cache_hits / max(1, planner.plan_requests)
                     waypoint_reduction = 100.0 * (
                         planner.raw_waypoints - planner.smoothed_waypoints
                     ) / max(1, planner.raw_waypoints)
+                    average_route_stretch = (
+                        planner.total_route_distance
+                        / max(1.0, planner.total_direct_distance)
+                    )
                     poison_total = self.Play.poison_compute_count + self.Play.poison_cache_count
                     poison_saved = 100.0 * self.Play.poison_cache_count / max(1, poison_total)
                     print(
@@ -630,17 +670,62 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                         f"wall inferences avoided={wall_saved:.1f}%, "
                         f"poison scans avoided={poison_saved:.1f}%, "
                         f"A* cache hits={path_saved:.1f}%, "
+                        f"A* stale routes rejected={planner.stale_path_rejections}, "
+                        f"A* occupancy rebuilds={planner.occupancy_rebuilds}, "
+                        f"blocked grid edges={len(planner._blocked_edges)}, "
+                        f"overlap exits opened="
+                        f"{planner.overlap_escape_cells_opened}, "
+                        f"overlap exits approved="
+                        f"{self.Play.overlap_escape_approvals}, "
                         f"A* nodes={planner.expanded_nodes}, "
                         f"path waypoint reduction={waypoint_reduction:.1f}%, "
+                        f"route stretch avg/max="
+                        f"{average_route_stretch:.2f}/"
+                        f"{planner.maximum_route_stretch:.2f}, "
+                        f"backward path starts="
+                        f"{planner.backward_first_steps}, "
                         f"routes={planner.routes_found}/{planner.routes_failed}, "
+                        f"fine routes={self.Play.fine_path_successes}/{self.Play.fine_path_requests}, "
+                        f"fine upgrades={self.Play.fine_path_upgrades}, "
+                        f"failed-route penalties={self.Play.unreachable_goal_avoids}, "
+                        f"route recoveries={self.Play.route_recoveries}, "
                         f"detour reversals blocked={self.Play.detour_reversals_prevented}, "
                         f"stale moves overridden={self.Play.stale_movement_overrides}, "
                         f"opposite goals overridden={self.Play.opposite_goal_overrides}, "
+                        f"short-forward overrides={self.Play.short_forward_overrides}, "
                         f"collision corrections/stops={self.Play.collision_corrections}/{self.Play.collision_stops}, "
+                        f"short safe advances={self.Play.progressive_escape_moves}, "
+                        f"camera goal shifts={self.Play.camera_goal_compensations}, "
+                        f"wrong-way corrections={self.Play.wrong_way_corrections}, "
+                        f"goal switches={goal_switch_rate:.1f}%, "
+                        f"goal downgrade holds={self.Play.goal_downgrade_holds}, "
+                        f"idle decisions={idle_decision_rate:.1f}%, "
+                        f"direct movement={direct_move_rate:.1f}%, "
                         f"stale wall stops={self.Play.stale_wall_stops}, "
+                        f"walls tracked={len(self.Play.last_walls_data)}, "
+                        f"projected wall frames={self.Play.wall_projection_uses}, "
+                        f"wall nav ready={self.Play._wall_navigation_ready}, "
+                        f"goal={self.Play.persistent_data.get('navigation_goal', 'unknown')}, "
+                        f"goal mix={goal_distribution}, "
+                        f"failed route mix={route_failure_distribution}, "
+                        f"objective stability={self.Play.objective_stability}, "
+                        f"power cubes visible="
+                        f"{len(getattr(self.Play, '_power_cube_cache', ()))}, "
+                        f"cube candidates rejected="
+                        f"{self.Play.power_cube_candidates_rejected}, "
+                        f"goal vector="
+                        f"({self.Play._last_strategic_movement[0]:.0f},"
+                        f"{self.Play._last_strategic_movement[1]:.0f}), "
+                        f"output vector="
+                        f"({self.Play._last_output_movement[0]:.0f},"
+                        f"{self.Play._last_output_movement[1]:.0f}), "
+                        f"cube scans/cache={self.Play.power_cube_scans}/"
+                        f"{self.Play.power_cube_cache_hits}, "
                         f"unsafe attacks/supers blocked="
                         f"{self.Play.unsafe_attack_requests_blocked}/"
-                        f"{self.Play.unsafe_super_requests_blocked}"
+                        f"{self.Play.unsafe_super_requests_blocked}, "
+                        f"unknown-map attacks blocked="
+                        f"{self.Play.unknown_geometry_attacks_blocked}"
                     )
                     self.last_performance_report = inference_now
 
