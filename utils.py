@@ -17,11 +17,32 @@ from packaging import version
 import traceback
 
 def get_brawler_stats(_player_info, _brawler_name):
+    normalize = lambda name: ''.join(c for c in str(name).casefold() if c.isalnum())
+    for brawler in (_player_info or {}).get('brawlers', []):
+        if normalize(brawler.get('name', '')) == normalize(_brawler_name):
+            return brawler.get('trophies'), None
     return None, None
 
 
 def get_player_info(_tag):
-    return None
+    from urllib.parse import quote
+    tag = str(_tag or '').strip().upper().replace('%23', '').lstrip('#')
+    from brawl_api_credentials import load_token
+    token = load_token()
+    if not tag or not token:
+        return None
+    try:
+        response = requests.get(
+            'https://api.brawlstars.com/v1/players/' + quote('#' + tag, safe=''),
+            headers={'Authorization': 'Bearer ' + token}, timeout=(3, 5),
+        )
+        response.raise_for_status()
+        profile = response.json()
+        if not isinstance(profile, dict) or profile.get('tag') != '#' + tag:
+            return None
+        return profile
+    except (requests.RequestException, ValueError):
+        return None
 
 
 def _get_project_root():

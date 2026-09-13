@@ -1,133 +1,161 @@
-import sys
-import platform
-import subprocess
+"""Launch the Hamster BOT setup wizard in a native Windows window."""
+from __future__ import annotations
+
 import os
-import shutil
-import glob
-import importlib
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
 
-# --- LOOP-PROOF BOOTSTRAP ---
+import webview
 
-def bootstrap():
-    if os.environ.get("PYLAAI_BOOTSTRAP") == "1":
-        return
-    try:
-        import jaraco.functools
-        import wheel
-    except ImportError:
-        print("\nDetected missing core tools. Stabilizing environment...")
-        os.environ["PYLAAI_BOOTSTRAP"] = "1"
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
-        print("Environment stabilized. Restarting setup...\n")
-        subprocess.run([sys.executable] + sys.argv)
-        sys.exit(0)
+ROOT = Path(__file__).resolve().parent
+CONFIG = ROOT / "cfg" / "general_config.toml"
+HTML = ROOT / "setup" / "index.html"
+ART = ROOT / "images" / "hamster_setup.webp"
+ICON = ROOT / "images" / "hamster_setup.ico"
 
-if any(cmd in sys.argv for cmd in ["install", "develop"]):
-    bootstrap()
 
-from setuptools import setup, find_packages
-
-def get_requirement_name(req):
-    req = req.strip()
-
-    if " @ " in req:
-        name = req.split(" @ ", 1)[0].strip()
-    else:
-        name = req
-        for sep in ["~=", ">=", "<=", "==", "!=", ">", "<"]:
-            name = name.split(sep, 1)[0]
-
-    name = name.split("[", 1)[0].strip()
-    return name.replace("-", "_").lower()
-
-def check_base_requirements(req_list):
-    print("\nVerifying base requirements...")
-    for req in req_list:
-        pkg_name = get_requirement_name(req)
-        mapping = {
-            "opencv_python": "cv2",
-            "discord.py": "discord",
-            "pillow": "PIL",
-            "pywin32": "win32api",
-            "onnxruntime_directml": "onnxruntime",
-            "pycryptodome": "Crypto",
-            "flask": "flask",
-        }
-        import_name = mapping.get(pkg_name, pkg_name)
-
-        try:
-            importlib.import_module(import_name)
-            print(f"  [OK] {req}")
-        except ImportError:
-            print(f"  [INSTALLING] {req}")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", req])
-
-def get_gpu_info():
-    try:
-        output = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader,nounits"],
-            encoding='utf-8'
-        )
-        cc = float(output.strip().split('\n')[0])
-        return "nvidia", cc
-    except:
-        return "other", 0.0
-
-# --- MAIN SETUP ---
-install_requires = [
-    "aiohttp~=3.13",
-    "opencv-python~=4.11",
-    "numpy~=2.3",
-    "onnxruntime-directml~=1.24",
-    "requests~=2.32",
-    "toml~=0.10",
-    "pillow>=11.2.1",
-    "discord.py~=2.7",
-    "packaging>=25.0",
-    "pywin32>=311",
-    "adbutils~=2.12",
-    "av~=12.3",
-    "Flask~=3.1",
-    "pycryptodome~=3.21",
-    "pywebview~=6.2.1"
-]
-
-setup(
-    name="PylaAI",
-    version="1.0.0",
-    packages=find_packages(exclude=["api", "cfg", "images", "models"]),
-    install_requires=install_requires,
-)
-
-if any(cmd in sys.argv for cmd in ["install", "develop"]):
-    try:
-        check_base_requirements(install_requires)
-
-        # --- ONNX ACCELERATOR SETUP ---
-        gpu_type, cc = get_gpu_info()
-        installed_onnx = "ONNX Runtime (DirectML)"
-
-        if gpu_type == "nvidia":
-            try:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "onnxruntime-gpu"])
-                installed_onnx = "ONNX Runtime (GPU)"
-            except Exception:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "onnxruntime-directml"])
-                installed_onnx = "ONNX Runtime (DirectML)"
+class SetupApi:
+    def complete_setup(self, desktop=False, start_menu=False):
+        CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        value = CONFIG.read_text(encoding="utf-8") if CONFIG.exists() else ""
+        if "setup_complete =" in value:
+            value = re.sub(r'^setup_complete\s*=.*$', "setup_complete = true", value, flags=re.M)
         else:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "onnxruntime-directml"])
-            installed_onnx = "ONNX Runtime (DirectML)"
+            value = value.rstrip() + "\nsetup_complete = true\n"
+        CONFIG.write_text(value, encoding="utf-8")
+        try:
+            shortcuts = create_shortcuts(bool(desktop), bool(start_menu))
+        except Exception as error:
+            shortcuts = {"desktop": False, "start_menu": False, "error": str(error)}
+        return {"ok": True, "shortcuts": shortcuts}
 
-        # Conflict Resolution
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "adbutils==2.12.0", "av==12.3.0"])
+    def launch_main(self):
+        from hamster_bot import launch_dashboard
+        process = launch_dashboard()
+        if webview.windows:
+            webview.windows[0].destroy()
+        return {"ok": True, "pid": process.pid}
 
-        os.system('cls' if os.name == 'nt' else 'clear')
-        print("\n" + "="*50 + "\n              SETUP COMPLETED!                \n" + "="*50)
-        print(
-            f"  - ONNX Engine:      {installed_onnx}\n"
-            + "="*50 + "\n"
+    def close(self):
+        if webview.windows:
+            webview.windows[0].destroy()
+        return True
+
+
+def main():
+    window = webview.create_window(
+        "Hamster BOT Setup",
+        url=HTML.as_uri(),
+        js_api=SetupApi(),
+        width=1280,
+        height=720,
+        min_size=(980, 600),
+        resizable=True,
+        fullscreen=True,
+        on_top=True,
+        background_color="#f4f7ff",
+    )
+    webview_data = Path(os.environ.get("LOCALAPPDATA", ROOT)) / "HamsterBOT" / "setup-webview"
+    webview.start(
+        initialize_window,
+        (window, "--e2e-complete" in sys.argv),
+        debug=False,
+        private_mode=False,
+        storage_path=str(webview_data),
+    )
+
+
+def initialize_window(window, run_e2e=False):
+    set_native_icon()
+    if run_e2e:
+        time.sleep(0.8)
+        window.evaluate_js(
+            "page=2; render(); document.querySelector('#desktop').checked=true; "
+            "document.querySelector('#start-menu').checked=true; finishSetup();"
         )
 
-    except Exception as e:
-        print(f"\n[ERROR] {e}")
-        sys.exit(1)
+
+def create_shortcuts(desktop, start_menu):
+    """Create launchers that always route incomplete installs back to setup."""
+    if not desktop and not start_menu:
+        return {"desktop": False, "start_menu": False}
+    import pythoncom
+    import win32com.client
+
+    pythoncom.CoInitialize()
+    shell = win32com.client.Dispatch("WScript.Shell")
+    python = Path(sys.executable)
+    pythonw = python.with_name("pythonw.exe")
+    executable = pythonw if pythonw.exists() else python
+
+    def make_link(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        shortcut = shell.CreateShortcut(str(path))
+        shortcut.TargetPath = str(executable)
+        shortcut.Arguments = f'"{ROOT / "hamster_bot.py"}"'
+        shortcut.WorkingDirectory = str(ROOT)
+        shortcut.IconLocation = f"{ICON},0"
+        shortcut.Description = "Launch Hamster Bot"
+        shortcut.Save()
+
+    desktop_ok = False
+    start_ok = False
+    errors = []
+    try:
+        if desktop:
+            try:
+                make_link(Path(shell.SpecialFolders("Desktop")) / "Hamster Bot.lnk")
+                desktop_ok = True
+            except Exception as error:
+                errors.append(f"Desktop shortcut: {error}")
+        if start_menu:
+            try:
+                start_link = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Hamster Bot.lnk"
+                make_link(start_link)
+                start_ok = True
+                try:
+                    explorer = win32com.client.Dispatch("Shell.Application")
+                    item = explorer.Namespace(str(start_link.parent)).ParseName(start_link.name)
+                    for verb in item.Verbs():
+                        if "pin to start" in str(verb.Name).replace("&", "").strip().lower():
+                            verb.DoIt()
+                            break
+                except Exception:
+                    # Windows may require the user to confirm tile pinning,
+                    # but the app remains installed and searchable in Start.
+                    pass
+            except Exception as error:
+                errors.append(f"Start-menu shortcut: {error}")
+        return {"desktop": desktop_ok, "start_menu": start_ok, "errors": errors}
+    finally:
+        pythoncom.CoUninitialize()
+
+
+def set_native_icon():
+    """Replace Python's default title-bar icon after WebView creates its HWND."""
+    try:
+        import time
+        import win32api
+        import win32con
+        import win32gui
+        handle = 0
+        for _ in range(30):
+            handle = win32gui.FindWindow(None, "Hamster BOT Setup")
+            if handle:
+                break
+            time.sleep(0.1)
+        if not handle:
+            return
+        icon = win32gui.LoadImage(0, str(ICON), win32con.IMAGE_ICON, 0, 0,
+                                  win32con.LR_LOADFROMFILE | win32con.LR_DEFAULTSIZE)
+        win32api.SendMessage(handle, win32con.WM_SETICON, win32con.ICON_SMALL, icon)
+        win32api.SendMessage(handle, win32con.WM_SETICON, win32con.ICON_BIG, icon)
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()

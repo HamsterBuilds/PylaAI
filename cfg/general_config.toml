@@ -13,3 +13,4 @@ default_trophy_target = 1000
 auto_load_queue_on_startup = true
 play_order = "in_order"
 interface_mode = "desktop"
+setup_complete = true

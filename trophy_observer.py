@@ -116,7 +116,7 @@ class TrophyObserver:
         save_dict_as_toml({"trophies": self.trophy_ledger}, self.trophy_ledger_file)
 
     def select_brawler(self, brawler, fallback_trophies):
-        """Use the queue/API total until fresh lobby OCR confirms a new one."""
+        """Start from the queue value, then maintain a local result-based estimate."""
         key = str(brawler).lower().strip()
         try:
             fallback = max(0, int(fallback_trophies))

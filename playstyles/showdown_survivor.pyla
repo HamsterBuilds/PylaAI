@@ -71,6 +71,15 @@ if must_hold_attack and persistent_data["time_since_holding_attack"] is not None
 
 safe_range, attack_range, super_range = get_brawler_range(brawler)
 player_pos = get_player_position(player_data)
+health_mode = persistent_data.get("health_mode")
+if player_health.get("low") and is_there_enemy(enemy_data):
+    health_mode = "escaping"
+    persistent_data["health_mode"] = health_mode
+    persistent_data["health_enemy_last_seen"] = time.monotonic()
+elif health_mode and player_health.get("healed"):
+    health_mode = None
+    persistent_data["health_mode"] = None
+    persistent_data["health_escape_vector"] = None
 #if debug: print("found player pos:", player_pos)
 anti_poison_gas_movement = avoid_poison_gas()
 if anti_poison_gas_movement:
@@ -79,7 +88,7 @@ if anti_poison_gas_movement:
 cube_coords, cube_distance = find_closest_power_cube(
     power_cube_data, player_pos, walls
 )
-if cube_coords and not anti_poison_gas_movement:
+if cube_coords and not anti_poison_gas_movement and not health_mode:
     # A dropped cube is guaranteed value and disappears when collected. It
     # outranks boxes, enemies and formation-following while visible.
     persistent_data["navigation_goal"] = "power_cube"
@@ -90,7 +99,26 @@ if cube_coords and not anti_poison_gas_movement:
     )
 elif not is_there_enemy(enemy_data):
     if not anti_poison_gas_movement:
-        movement = no_enemy_movement()
+        if health_mode == "escaping":
+            if time.monotonic() - persistent_data.get("health_enemy_last_seen", 0.0) >= 1.15:
+                health_mode = "healing"
+                persistent_data["health_mode"] = health_mode
+            movement = persistent_data.get("health_escape_vector") or no_enemy_movement()
+            persistent_data["navigation_goal"] = "health_escape"
+        elif health_mode == "healing":
+            closest_teammate_coords, dist = find_closest_teammate(
+                teammate_data, player_pos, walls
+            )
+            if closest_teammate_coords and dist > TILE_SIZE * 0.85:
+                movement = (
+                    closest_teammate_coords[0] - player_pos[0],
+                    closest_teammate_coords[1] - player_pos[1],
+                )
+            else:
+                movement = get_teammate_search_movement(player_data, walls)
+            persistent_data["navigation_goal"] = "health_heal"
+        else:
+            movement = no_enemy_movement()
 elif not anti_poison_gas_movement:
     enemy_coords, enemy_distance = find_closest_enemy(enemy_data, player_pos, walls, "attack")
     if enemy_coords is None:
@@ -114,7 +142,14 @@ elif not anti_poison_gas_movement:
             direction_x = enemy_coords[0] - player_pos[0]
             direction_y = enemy_coords[1] - player_pos[1]
             previous_combat_mode = persistent_data.get("combat_mode")
-            if (
+            if health_mode:
+                persistent_data["health_enemy_last_seen"] = time.monotonic()
+                escape_vector = (-direction_x, -direction_y)
+                persistent_data["health_escape_vector"] = escape_vector
+                persistent_data["navigation_goal"] = "health_escape"
+                persistent_data["combat_mode"] = "health_retreat"
+                movement = escape_vector
+            elif (
                 not attack_hittable
                 or safe_range <= 0
                 or enemy_distance > safe_range * (
@@ -144,7 +179,8 @@ elif not anti_poison_gas_movement:
                     player_data, player_pos, enemy_coords, walls
                 )
 
-        if is_super_ready and persistent_data["time_since_holding_attack"] is None:
+        may_attack = health_mode != "healing"
+        if may_attack and is_super_ready and persistent_data["time_since_holding_attack"] is None:
             super_type = brawler_info['super_type']
             enemy_hittable = super_hittable
 
@@ -159,7 +195,7 @@ elif not anti_poison_gas_movement:
                 use_super()
 
         # Attack if enemy is within attack range and hittable
-        if enemy_distance <= attack_range:
+        if may_attack and enemy_distance <= attack_range:
             enemy_hittable = attack_hittable
             if enemy_hittable:
                 if is_gadget_ready and persistent_data["time_since_holding_attack"] is None:

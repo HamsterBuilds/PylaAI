@@ -13,6 +13,7 @@ from detect import Detect
 from state_finder import get_state
 from perception import DetectionStabilizer, SceneChangeGate
 from pathfinding import LocalPathPlanner
+from health_monitor import HealthMonitor
 from utils import load_toml_as_dict, count_hsv_pixels, load_brawlers_info, interpret_pyla_code, \
     JOYSTICK_RADIUS, clamp, config_bool, is_safe_ast, SAFE_GLOBALS
 
@@ -23,10 +24,10 @@ gadget_crop_area = load_toml_as_dict("./cfg/lobby_config.toml")['pixel_counter_c
 hypercharge_crop_area = load_toml_as_dict("./cfg/lobby_config.toml")['pixel_counter_crop_area']['hypercharge']
 POISON_LOW_HSV = np.array((30, 90, 221), dtype=np.uint8)
 POISON_HIGH_HSV = np.array((57, 114, 235), dtype=np.uint8)
-POWER_CUBE_LOW_HSV = np.array((28, 155, 175), dtype=np.uint8)
+POWER_CUBE_LOW_HSV = np.array((35, 70, 155), dtype=np.uint8)
 POWER_CUBE_HIGH_HSV = np.array((82, 255, 255), dtype=np.uint8)
-POWER_CUBE_CORE_LOW_HSV = np.array((34, 185, 205), dtype=np.uint8)
-POWER_CUBE_CORE_HIGH_HSV = np.array((72, 255, 255), dtype=np.uint8)
+POWER_CUBE_CORE_LOW_HSV = np.array((15, 70, 180), dtype=np.uint8)
+POWER_CUBE_CORE_HIGH_HSV = np.array((38, 255, 255), dtype=np.uint8)
 class Play:
 
     def __init__(self, main_info_model, tile_detector_model, close_tile_detector_model, window_controller, pyla_code):
@@ -76,6 +77,13 @@ class Play:
         )
         self.centered_wall_detection = config_bool(bot_config.get("centered_wall_detection"), False)
         self.centered_wall_crop_size = 640
+        # Shooting LOS must cover long-range attacks, while A* can keep its
+        # smaller and cheaper local planning window.
+        self.wall_detection_crop_size = max(
+            self.centered_wall_crop_size,
+            int(bot_config.get("wall_detection_crop_size", 1440)),
+        )
+        self._wall_detection_bounds = None
 
         self.verbose_debug = config_bool(load_toml_as_dict("cfg/debug_settings.toml").get('verbose_debug'), False)
         if self.verbose_debug:
@@ -103,6 +111,10 @@ class Play:
 
         self.time_since_walls_checked = 0
         self.time_since_player_last_found = time.time()
+        # A fresh raw player detection proves that the screen is gameplay.
+        # The state checker can then skip redundant end-screen templates.
+        self._raw_player_observed_at = 0.0
+        self.state_match_scans_avoided = 0
         self.current_brawler = None
         self.brawlers_info = load_brawlers_info()
         self.brawler_ranges = None
@@ -148,12 +160,23 @@ class Play:
         self._attack_authorized_until = 0.0
         self._super_authorized_until = 0.0
         self._current_enemy_data = ()
+        self.health_reading_maximum_age = max(
+            0.8, float(bot_config.get("health_reading_maximum_age", 1.8))
+        )
+        self.health_monitor = HealthMonitor(
+            interval=bot_config.get("health_detection_interval", 0.45),
+            low=bot_config.get("low_health_escape_threshold", 1500),
+            healed=bot_config.get("low_health_reengage_threshold", 3300),
+        )
         self.persistent_data = {
             "time_since_holding_attack": None,
             "charged_attack_ready": False,
             "navigation_goal": "initializing",
             "combat_mode": None,
             "poison_heading": None,
+            "health_mode": None,
+            "health_enemy_last_seen": 0.0,
+            "health_escape_vector": None,
         }
         self._playstyle_globals = None
         if isinstance(pyla_code, str):
@@ -313,6 +336,8 @@ class Play:
         self._power_cube_cache_player = None
         self._power_cube_buffer_shape = None
         self._power_cube_hsv_buffer = None
+        self._power_cube_hsv_frame_ref = None
+        self._power_cube_hsv_bounds = None
         self._power_cube_mask_buffer = None
         self._power_cube_core_mask_buffer = None
         self._power_cube_tracks = []
@@ -320,6 +345,7 @@ class Play:
         self.power_cube_scans = 0
         self.power_cube_cache_hits = 0
         self.power_cube_candidates_rejected = 0
+        self.shared_hsv_reuses = 0
         self.wall_inference_count = 0
         self.wall_cache_count = 0
         self.wall_projection_uses = 0
@@ -352,6 +378,8 @@ class Play:
             "enemy_approach": 2,
             "enemy_retreat": 2,
             "enemy_strafe": 2,
+            "health_escape": 4,
+            "health_heal": 3,
             "objective": 2,
             "fallback_enemy": 2,
             "fallback_objective": 2,
@@ -402,14 +430,16 @@ class Play:
         return True
 
     def use_hypercharge(self):
-        print("Using hypercharge")
+        if self.verbose_debug:
+            print("Using hypercharge")
         self.window_controller.press("hypercharge")
         self.time_since_hypercharge_checked = time.time()
         self._ability_used_at["hypercharge"] = time.monotonic()
         self.is_hypercharge_ready = False
 
     def use_gadget(self):
-        print("Using gadget")
+        if self.verbose_debug:
+            print("Using gadget")
         self.window_controller.press("gadget")
         self.time_since_gadget_checked = time.time()
         self._ability_used_at["gadget"] = time.monotonic()
@@ -419,7 +449,8 @@ class Play:
         if time.monotonic() > self._super_authorized_until:
             self.unsafe_super_requests_blocked += 1
             return False
-        print("Using super")
+        if self.verbose_debug:
+            print("Using super")
         self.window_controller.press("super")
         self.time_since_super_checked = time.time()
         self._ability_used_at["super"] = time.monotonic()
@@ -432,6 +463,7 @@ class Play:
     def remember_objective(self, position):
         if position is None or len(position) < 2:
             return
+        self._objective_approach_vector = None
         now = time.time()
         new_position = (float(position[0]), float(position[1]))
         scale = self.window_controller.scale_factor or 1.0
@@ -516,6 +548,14 @@ class Play:
             return None
         dx = self.objective_position[0] - player_position[0]
         dy = self.objective_position[1] - player_position[1]
+        previous = getattr(self, '_objective_approach_vector', None)
+        if previous is not None and dx * previous[0] + dy * previous[1] < 0:
+            # The unseen objective was passed between inference frames.
+            # A stale point must not turn pursuit into a backwards chase.
+            self.objective_position = None
+            self._objective_approach_vector = None
+            return None
+        self._objective_approach_vector = (dx, dy)
         arrival_distance = (
             self.TILE_SIZE * self.window_controller.scale_factor
             * self.objective_arrival_distance
@@ -780,15 +820,10 @@ class Play:
 
         self.power_cube_scans += 1
         frame_height, frame_width = self.frame.shape[:2]
-        half_size = min(
-            self.centered_wall_crop_size * 0.5,
-            frame_width * 0.46,
-            frame_height * 0.46,
-        )
-        x1 = max(0, int(player_position[0] - half_size))
-        y1 = max(0, int(player_position[1] - half_size))
-        x2 = min(frame_width, int(player_position[0] + half_size))
-        y2 = min(frame_height, int(player_position[1] + half_size))
+        # Pickups can be visible beyond the local wall-planning horizon.
+        # Scan the playfield, including its lower edge, at the existing cadence.
+        x1, y1 = 0, int(frame_height * 0.12)
+        x2, y2 = frame_width, frame_height
         if x2 <= x1 or y2 <= y1:
             return []
         roi = self.frame[y1:y2, x1:x2]
@@ -805,9 +840,11 @@ class Play:
         hsv = cv2.cvtColor(
             roi, cv2.COLOR_RGB2HSV, dst=self._power_cube_hsv_buffer
         )
-        # Dropped cubes have a highly saturated lime/green core. Poison is
-        # intentionally lower saturation and health bars are rejected below
-        # by geometry.
+        self._power_cube_hsv_frame_ref = weakref.ref(self.frame)
+        self._power_cube_hsv_bounds = (x1, y1, x2, y2)
+        # The green faces are moderately saturated under map lighting.
+        # Require the yellow lightning emblem as well as compact geometry:
+        # green alone also matches storm, foliage and health bars.
         mask = cv2.inRange(
             hsv,
             POWER_CUBE_LOW_HSV,
@@ -823,7 +860,7 @@ class Play:
         count, _, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
         scale = max(0.35, self.window_controller.scale_factor or 1.0)
         minimum_area = max(16, int(55 * scale * scale))
-        maximum_area = max(220, int(2600 * scale * scale))
+        maximum_area = max(500, int(5200 * scale * scale))
         minimum_side = max(4, int(7 * scale))
         maximum_side = max(24, int(82 * scale))
         cubes = []
@@ -1271,11 +1308,10 @@ class Play:
             # Wall boxes are screen-space coordinates. Once the camera moves,
             # an old box is not safe evidence for an auto-aim shot.
             result = False
-        elif self.get_distance(player_pos, enemy_pos) > self._navigation_visible_radius():
-            # The centred tile model only maps a local square around the
-            # player.  A missing wall beyond that crop is unknown terrain,
-            # not proof of clear line of sight (especially for long-range
-            # brawlers such as Belle).
+        elif not self._wall_geometry_covers_segment(player_pos, enemy_pos):
+            # Outside the detector crop terrain is unknown. Use the actual
+            # observed bounds rather than A*'s shorter planning radius so a
+            # long-range brawler can shoot as soon as its lane is verified.
             self.unknown_geometry_attacks_blocked += 1
             result = False
         else:
@@ -1318,9 +1354,8 @@ class Play:
                             player_pos, position
                         ),
                     )
-                if (
-                    self.get_distance(player_pos, autoaim_pos)
-                    > self._navigation_visible_radius()
+                if not self._wall_geometry_covers_segment(
+                    player_pos, autoaim_pos
                 ):
                     self.unknown_geometry_attacks_blocked += 1
                     autoaim_is_safe = False
@@ -1641,7 +1676,14 @@ class Play:
             arrival_distance = self.TILE_SIZE * 0.58 * (
                 self.window_controller.scale_factor or 1.0
             )
-            if teammate_distance > arrival_distance:
+            remembered_dx = self.last_teammate_position[0] - player_coords[0]
+            remembered_dy = self.last_teammate_position[1] - player_coords[1]
+            passed_anchor = (
+                self.last_teammate_direction is not None
+                and remembered_dx * self.last_teammate_direction[0]
+                    + remembered_dy * self.last_teammate_direction[1] < 0
+            )
+            if teammate_distance > arrival_distance and not passed_anchor:
                 teammate_anchor = self.last_teammate_position
             else:
                 # Search across the last approach lane instead of continuing
@@ -1655,6 +1697,10 @@ class Play:
                 self._teammate_search_changed_at = time.time()
                 teammate_anchor = None
                 teammate_distance = float('inf')
+                # A missed observation is not evidence that the teammate
+                # turned around. Retire a reached/passed point so camera
+                # motion cannot make us chase it backwards next frame.
+                self.last_teammate_position = None
         else:
             teammate_distance = float('inf')
         result = (teammate_anchor, teammate_distance)
@@ -1733,9 +1779,29 @@ class Play:
             self._poison_filtered_mask_buffer = np.empty(
                 roi_shape, dtype=np.uint8
             )
-        hsv_roi = cv2.cvtColor(
-            roi, cv2.COLOR_RGB2HSV, dst=self._poison_hsv_buffer
+        shared_hsv = None
+        shared_frame = (
+            self._power_cube_hsv_frame_ref()
+            if self._power_cube_hsv_frame_ref is not None else None
         )
+        shared_bounds = self._power_cube_hsv_bounds
+        if shared_frame is self.frame and shared_bounds is not None:
+            shared_x1, shared_y1, shared_x2, shared_y2 = shared_bounds
+            if (
+                shared_x1 <= min_x and shared_y1 <= min_y
+                and shared_x2 >= max_x and shared_y2 >= max_y
+            ):
+                shared_hsv = self._power_cube_hsv_buffer[
+                    min_y - shared_y1:max_y - shared_y1,
+                    min_x - shared_x1:max_x - shared_x1,
+                ]
+        if shared_hsv is None:
+            hsv_roi = cv2.cvtColor(
+                roi, cv2.COLOR_RGB2HSV, dst=self._poison_hsv_buffer
+            )
+        else:
+            hsv_roi = shared_hsv
+            self.shared_hsv_reuses += 1
         mask = cv2.inRange(
             hsv_roi, POISON_LOW_HSV, POISON_HIGH_HSV,
             dst=self._poison_mask_buffer
@@ -1848,6 +1914,34 @@ class Play:
             * abs(y) / magnitude
         )
 
+    def guard_storm_movement(self, player_box, movement, walls, distance):
+        """Apply storm geometry after all strategy and detour rewrites."""
+        regions = self._poison_danger_regions
+        if not regions or math.hypot(*movement) < 1:
+            return movement
+        radius = self.navigation_player_radius * (self.window_controller.scale_factor or 1.0)
+        regions = tuple((x1 - radius, y1 - radius, x2 + radius, y2 + radius)
+                        for x1, y1, x2, y2 in regions)
+        start = self.get_player_position(player_box)
+
+        def safe(candidate):
+            length = math.hypot(*candidate)
+            end = (start[0] + candidate[0] / length * distance,
+                   start[1] + candidate[1] / length * distance)
+            return (
+                LocalPathPlanner._segment_clear_while_exiting(start, end, regions)
+                and not self.is_path_blocked(player_box, candidate, walls,
+                                             distance=distance)
+            )
+
+        if safe(movement):
+            return movement
+        alternatives = [self.rotate_movement(movement, step * math.pi / 8)
+                        for step in (1, -1, 2, -2, 3, -3, 4, -4, 6, -6, 8)]
+        alternatives.sort(key=self._movement_poison_risk)
+        return next((candidate for candidate in alternatives if safe(candidate)),
+                    (0.0, 0.0))
+
     def get_main_data(self, frame, cache_for_reuse=False):
         prepared_frame = self._prepared_frame_ref() if self._prepared_frame_ref else None
         if prepared_frame is frame and self._prepared_main_data is not None:
@@ -1856,11 +1950,22 @@ class Play:
             self._prepared_main_data = None
             return data
         data = self.Detect_main_info.detect_objects(frame, conf_tresh=self.entity_detection_confidence)
+        if data.get("player"):
+            self._raw_player_observed_at = time.monotonic()
+        else:
+            self._raw_player_observed_at = 0.0
         data = self.detection_stabilizer.update(data)
         if cache_for_reuse:
             self._prepared_frame_ref = weakref.ref(frame)
             self._prepared_main_data = data
         return data
+
+    def has_fresh_raw_player(self, maximum_age=0.5):
+        observed_at = self._raw_player_observed_at
+        return bool(
+            observed_at > 0.0
+            and time.monotonic() - observed_at <= maximum_age
+        )
 
     def probe_match_started(self, frame):
         self.get_main_data(frame, cache_for_reuse=True)
@@ -1885,6 +1990,7 @@ class Play:
         self._target_memory.clear()
         self._prepared_frame_ref = None
         self._prepared_main_data = None
+        self._raw_player_observed_at = 0.0
         self.last_attack_at = 0.0
         self.is_gadget_ready = False
         self.is_hypercharge_ready = False
@@ -1895,6 +2001,7 @@ class Play:
         self._attack_authorized_until = 0.0
         self._super_authorized_until = 0.0
         self._current_enemy_data = ()
+        self.health_monitor.reset()
         self.last_movement = ''
         self.last_movement_change_time = 0.0
         self._last_navigation_goal = "initializing"
@@ -1903,6 +2010,9 @@ class Play:
         self.persistent_data["navigation_goal"] = "initializing"
         self.persistent_data["combat_mode"] = None
         self.persistent_data["poison_heading"] = None
+        self.persistent_data["health_mode"] = None
+        self.persistent_data["health_enemy_last_seen"] = 0.0
+        self.persistent_data["health_escape_vector"] = None
         self.objective_position = None
         self.objective_expires_at = 0.0
         self.objective_stability = 0
@@ -1948,6 +2058,8 @@ class Play:
         self._power_cube_cache_player = None
         self._power_cube_buffer_shape = None
         self._power_cube_hsv_buffer = None
+        self._power_cube_hsv_frame_ref = None
+        self._power_cube_hsv_bounds = None
         self._power_cube_mask_buffer = None
         self._power_cube_core_mask_buffer = None
         self._power_cube_tracks = []
@@ -2069,12 +2181,27 @@ class Play:
             visible_size = min(visible_size, self.window_controller.height)
         return visible_size * 0.45
 
+    def _wall_geometry_covers_segment(self, start, end):
+        """Whether the latest wall inference observed the complete shot lane."""
+        if not self._wall_detection_bounds:
+            return False
+        left, top, right, bottom = self._wall_detection_bounds
+        margin = self.line_of_sight_wall_padding * (
+            self.window_controller.scale_factor or 1.0
+        )
+        return all(
+            left + margin <= point[0] <= right - margin
+            and top + margin <= point[1] <= bottom - margin
+            for point in (start, end)
+        )
+
     def _navigation_goal_distance(self, magnitude):
         """Do not plan beyond a visible, position-based objective."""
         scale = self.window_controller.scale_factor or 1.0
         precise_goals = {
             "objective", "power_cube", "fallback_power_cube",
             "teammate", "teammate_formation",
+            "health_heal",
             "enemy_approach", "fallback_enemy", "fallback_objective",
             "fallback_teammate", "route_recovery_teammate",
         }
@@ -2800,6 +2927,7 @@ class Play:
                 + tuple(data.get('teammate') or ()),
             tuple(data.get('wall') or ()),
         )
+        self.health_monitor.submit(self.frame, data['player'][0])
         # Navigation safety must not depend on the selected playstyle opting
         # into poison detection.
         self.is_there_poison_gas(data['player'][0])
@@ -2858,6 +2986,9 @@ class Play:
         dynamic['last_movement'] = self.last_movement
         dynamic['last_movement_change_time'] = self.last_movement_change_time
         dynamic['debug'] = self.verbose_debug
+        dynamic['player_health'] = self.health_monitor.snapshot(
+            self.health_reading_maximum_age
+        )
         if self._playstyle_globals is None or not self._playstyle_context_initialized:
             self.context.update(self._dynamic_context)
         movement = self.get_movement()
@@ -2890,6 +3021,10 @@ class Play:
             "navigation_goal", "unknown"
         )
         if navigation_goal != self._last_navigation_goal:
+            # Hysteresis belongs to a goal, not the joystick globally. A
+            # previous retreat/search direction must not override pursuit.
+            self.last_movement = ''
+            self.last_movement_change_time = 0.0
             self.navigation_goal_switches += 1
             self._last_navigation_goal = navigation_goal
         self.navigation_goal_counts[navigation_goal] = (
@@ -3225,6 +3360,15 @@ class Play:
             ):
                 self.wall_scene_gate.request_refresh()
                 self._last_obstacle_refresh_request = refresh_now
+        storm_guarded = self.guard_storm_movement(
+            data['player'][0], movement, data['wall'], final_safety_distance
+        )
+        if storm_guarded != movement:
+            movement = storm_guarded
+            self.last_movement = movement
+            self.last_movement_change_time = current_time
+            self._detour_heading = None
+            self._detour_expires_at = 0.0
         self._last_output_movement = movement
         return movement
 
@@ -3310,10 +3454,10 @@ class Play:
         # 640px square is taller than a 540px frame; the old clamp then got a
         # negative upper bound and sliced only a thin strip from the bottom.
         # That made terrain effectively invisible to both A* and shot LOS.
-        crop_size = min(
-            self.centered_wall_crop_size, frame_width, frame_height
-        )
-        if crop_size <= 0:
+        crop_width = min(self.wall_detection_crop_size, frame_width)
+        crop_height = min(self.wall_detection_crop_size, frame_height)
+        if crop_width <= 0 or crop_height <= 0:
+            self._wall_detection_bounds = (0, 0, frame_width, frame_height)
             return frame, 0, 0
 
         if player_data:
@@ -3322,13 +3466,14 @@ class Play:
             center_x, center_y = frame_width / 2, frame_height / 2
 
         crop_x1 = int(clamp(
-            round(center_x - crop_size / 2), 0, frame_width - crop_size
+            round(center_x - crop_width / 2), 0, frame_width - crop_width
         ))
         crop_y1 = int(clamp(
-            round(center_y - crop_size / 2), 0, frame_height - crop_size
+            round(center_y - crop_height / 2), 0, frame_height - crop_height
         ))
-        crop_x2 = crop_x1 + crop_size
-        crop_y2 = crop_y1 + crop_size
+        crop_x2 = crop_x1 + crop_width
+        crop_y2 = crop_y1 + crop_height
+        self._wall_detection_bounds = (crop_x1, crop_y1, crop_x2, crop_y2)
 
         return frame[crop_y1:crop_y2, crop_x1:crop_x2], crop_x1, crop_y1
 
@@ -3360,6 +3505,8 @@ class Play:
         if self.Detect_tile_detector is None:
             self.preload_wall_model()
             return None
+        frame_height, frame_width = frame.shape[:2]
+        self._wall_detection_bounds = (0, 0, frame_width, frame_height)
         tile_data = self.Detect_tile_detector.detect_objects(frame, conf_tresh=self.wall_detection_confidence)
         return tile_data
 
@@ -3829,16 +3976,18 @@ class Play:
         data = self.get_main_data(frame)
         # Navigation cannot use walls without a player position. Defer that
         # network until a usable entity frame arrives; leave its timer due.
-        if data.get("player") and current_time - self.time_since_walls_checked > self.walls_treshold:
-            refresh_walls, wall_sample = self.wall_scene_gate.should_refresh(frame, current_time)
+        if (
+            data.get("player")
+            and current_time - self.time_since_walls_checked
+                > self.walls_treshold
+        ):
+            refresh_walls, wall_sample = self.wall_scene_gate.should_refresh(
+                frame, current_time
+            )
             if refresh_walls:
                 self.wall_inference_count += 1
                 tile_data = self.get_tile_data(frame, data.get("player"))
                 if tile_data is None:
-                    # The model is still warming during matchmaking. Keep the
-                    # last geometry only briefly. Screen-space wall boxes
-                    # become unsafe after camera movement, so stop navigation
-                    # rather than steering through a stale obstacle map.
                     self.wall_inference_count -= 1
                     data['wall'] = self.get_projected_walls()
                     data['bush'] = self.last_bushes_data

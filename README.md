@@ -21,6 +21,36 @@ PylaAI is currently the best external Brawl Stars bot.
 
 ## Installation
 
+### Trophy API connection
+
+Trophy totals come from the official Brawl Stars player API. Trophy OCR is no
+longer used. On a console launch, missing API settings start a one-time setup:
+enter your player tag and a key from the Brawl Stars developer portal for your
+connection's allowed IP. The bot validates the account before saving anything.
+The key is encrypted by Windows for your account under LocalAppData/HamsterBOT,
+outside the repository and release archive. Future launches load it automatically.
+
+To replace the key or account, run `py -3.11 main.py --configure-api`.
+`BRAWL_STARS_API_TOKEN` remains available as an environment override. The bot
+cannot create a developer account or issue a key without your account access.
+If the connection fails, trophy totals remain unchanged rather than being guessed.
+
+### Windows release
+
+Download the latest `HamsterBOT-<version>.zip` from GitHub Releases and extract it to a folder you own. Open the setup wizard with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run.ps1 setup
+```
+
+(`python .\setup.py` also opens the same UI.)
+
+```powershell
+run hamster_bot
+```
+
+The release ZIP is created by `.uild_release.ps1 0.1.0`. It contains the runtime assets and models, so users do not need to clone the repository or install development files.
+
 You will need [Python 3.11.9](https://www.python.org/downloads/release/python-3119/).
 
 ### Windows

@@ -6,6 +6,7 @@ import time
 import threading
 import weakref
 from functools import lru_cache
+from collections import OrderedDict
 sys.path.append(os.path.abspath('/'))
 from utils import load_toml_as_dict, config_bool
 
@@ -88,6 +89,27 @@ def _template_score(frame, crop, template, key):
     cache = _match_cache.scores
     if key in cache:
         return cache[key]
+    history = getattr(_match_cache, 'history', None)
+    if history is None:
+        history = _match_cache.history = OrderedDict()
+        _match_cache.history_bytes = 0
+    # Production keys identify a template followed by its region. Share one
+    # pixel snapshot across all templates in that region instead of copying
+    # the end-result banner eight times.
+    region_key = key[1:] if isinstance(key, tuple) and len(key) == 4 else key
+    previous = history.get(region_key)
+    if previous is not None:
+        old_crop, scores = previous
+        if old_crop.shape == crop.shape and np.array_equal(old_crop, crop):
+            history.move_to_end(region_key)
+            saved = scores.get(key)
+            if saved is not None and saved[0] is template:
+                cache[key] = saved[1]
+                return saved[1]
+        else:
+            _match_cache.history_bytes -= old_crop.nbytes
+            del history[region_key]
+            previous = None
     result_height = crop.shape[0] - template.shape[0] + 1
     result_width = crop.shape[1] - template.shape[1] + 1
     result = cv2.matchTemplate(
@@ -96,7 +118,22 @@ def _template_score(frame, crop, template, key):
     )
     score = cv2.minMaxLoc(result)[1]
     cache[key] = score
+    if previous is not None:
+        previous[1][key] = (template, score)
+        return score
+    # Bound retained pixels independently of capture resolution. Reuse only
+    # byte-identical regions; changed pixels always take the original matcher.
+    budget = 8 * 1024 * 1024
+    if crop.nbytes <= budget:
+        while history and (_match_cache.history_bytes + crop.nbytes > budget
+                           or len(history) >= 64):
+            _, entry = history.popitem(last=False)
+            _match_cache.history_bytes -= entry[0].nbytes
+        history[region_key] = (crop.copy(), {key: (template, score)})
+        _match_cache.history_bytes += crop.nbytes
     return score
+
+
 
 
 def is_template_in_region(image, template_path, region, threshold=None):
@@ -149,6 +186,8 @@ def load_template(image_path, width, height):
     return resized_colored_image
 
 SHOWDOWN_PLACE_THRESHOLD = 0.9
+_CHECK_SHOWDOWN_RESULTS = True
+_CHECK_STANDARD_RESULTS = True
 showdown_place_templates = {
     0: ["1st.png"],
     1: ["2nd.png"],
@@ -156,16 +195,42 @@ showdown_place_templates = {
     3: ["4th.png"]
 }
 
+
+def configure_game_result_detection(gamemodes):
+    """Skip impossible end-screen templates for a known playstyle mode."""
+    global _CHECK_SHOWDOWN_RESULTS, _CHECK_STANDARD_RESULTS
+    if isinstance(gamemodes, str):
+        modes = (gamemodes.lower(),)
+    else:
+        modes = tuple(str(mode).lower() for mode in (gamemodes or ()))
+    if not modes or "all" in modes:
+        _CHECK_SHOWDOWN_RESULTS = True
+        _CHECK_STANDARD_RESULTS = True
+        return
+    has_showdown = any("showdown" in mode for mode in modes)
+    has_standard = any(
+        "3v3" in mode or "5v5" in mode for mode in modes
+    )
+    if not has_showdown and not has_standard:
+        _CHECK_SHOWDOWN_RESULTS = True
+        _CHECK_STANDARD_RESULTS = True
+        return
+    _CHECK_SHOWDOWN_RESULTS = has_showdown
+    _CHECK_STANDARD_RESULTS = has_standard
+
 def find_game_result(screenshot):
-    for place, template_files in showdown_place_templates.items():
-        for template_file in template_files:
-            if is_template_in_region(
-                    screenshot,
-                    end_results_path + template_file,
-                    match_result_crop_region,
-                    threshold=SHOWDOWN_PLACE_THRESHOLD
-            ):
-                return f"trio_showdown_{place}"
+    if _CHECK_SHOWDOWN_RESULTS:
+        for place, template_files in showdown_place_templates.items():
+            for template_file in template_files:
+                if is_template_in_region(
+                        screenshot,
+                        end_results_path + template_file,
+                        match_result_crop_region,
+                        threshold=SHOWDOWN_PLACE_THRESHOLD
+                ):
+                    return f"trio_showdown_{place}"
+    if not _CHECK_STANDARD_RESULTS:
+        return False
     is_victory = is_template_in_region(screenshot, end_results_path + 'victory.png', match_result_crop_region)
     if is_victory:
         return "victory"
@@ -265,39 +330,47 @@ def is_in_prestige_milestone(image):
 
 
 def find_lower_right_green_action(image):
-    """Locate wide green post-match action buttons such as LET'S GO."""
+    """Locate a wide green post-match action button such as LET'S GO.
+
+    The name is kept for compatibility, although current prestige layouts can
+    place the button on either side of the lower half of the screen.
+    """
     height, width = image.shape[:2]
-    # Matchmaking and gameplay contain many green regions. A prestige action
-    # is a large, bright, horizontal button in the extreme lower-right; do
-    # not classify arbitrary green terrain/UI as a modal state.
-    x1, y1 = int(width * 0.66), int(height * 0.76)
-    crop = image[y1:height, x1:width]
+    # Prestige variants have moved this control between the lower-left,
+    # centre, and lower-right. Restricting the search to the bottom quarter
+    # missed the newer LET'S GO layout. The button is still a large, bright,
+    # horizontal UI element, which separates it from map tiles and icons.
+    x1, y1 = int(width * 0.04), int(height * 0.52)
+    crop = image[y1:int(height * 0.98), x1:int(width * 0.96)]
     if crop.size == 0:
         return None
-    hsv = cv2.cvtColor(crop, cv2.COLOR_RGB2HSV)
-    mask = cv2.inRange(
-        hsv,
-        np.array((38, 125, 145), dtype=np.uint8),
-        np.array((95, 255, 255), dtype=np.uint8),
+    lower = np.array((35, 90, 105), dtype=np.uint8)
+    upper = np.array((100, 255, 255), dtype=np.uint8)
+    # scrcpy versions have returned both RGB and BGR arrays. Accept either
+    # ordering so a backend update cannot silently disable this button.
+    rgb_mask = cv2.inRange(cv2.cvtColor(crop, cv2.COLOR_RGB2HSV), lower, upper)
+    bgr_mask = cv2.inRange(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV), lower, upper)
+    mask = cv2.bitwise_or(rgb_mask, bgr_mask)
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (max(3, width // 320), max(3, height // 270))
     )
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     contours, _ = cv2.findContours(
         mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
     candidates = []
-    minimum_area = width * height * 0.0015
+    minimum_area = width * height * 0.002
     for contour in contours:
         area = cv2.contourArea(contour)
         if area < minimum_area:
             continue
         local_x, local_y, button_width, button_height = cv2.boundingRect(contour)
-        if button_height < height * 0.035 or button_width < width * 0.12:
+        if button_height < height * 0.035 or button_width < width * 0.14:
             continue
-        if button_width / max(button_height, 1) < 1.8:
-            continue
-        if local_x + button_width * 0.5 < (width - x1) * 0.18:
+        if button_width / max(button_height, 1) < 2.0:
             continue
         fill_ratio = area / max(button_width * button_height, 1)
-        if fill_ratio < 0.48:
+        if fill_ratio < 0.42:
             continue
         candidates.append((
             area,

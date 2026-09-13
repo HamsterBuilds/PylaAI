@@ -30,6 +30,11 @@ if __name__ == "__main__" and len(sys.argv) >= 9 and sys.argv[1] == "--debug-vie
     )
     sys.exit(0)
 
+if __name__ == '__main__' and '--configure-api' in sys.argv:
+    from brawl_api_credentials import configure
+    sys.exit(0 if configure() else 1)
+
+
 def parse_cli_args(argv=None):
     parser = argparse.ArgumentParser(
         prog="PylaAI",
@@ -123,7 +128,7 @@ import time
 from lobby_automation import LobbyAutomation
 from play import Play
 from stage_manager import StageManager
-from state_finder import get_state
+from state_finder import configure_game_result_detection, get_state
 from time_management import TimeManagement
 from utils import load_toml_as_dict, current_wall_model_is_latest, api_base_url, load_pyla_script, save_brawler_data, \
     clean_queue, get_discord_link
@@ -169,6 +174,9 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
             save_brawler_data(data)
             print("Starting with queue data:", data)
             self.playstyle_info, pyla_code = load_pyla_script(current_playstyle)
+            configure_game_result_detection(
+                self.playstyle_info.get("gamemodes")
+            )
             self.Play = Play(*self.load_models(), self.window_controller, pyla_code)
             # Model warm-up takes several seconds on old CPUs. Start it while
             # lobby/setup work is still happening so the first match frame
@@ -177,6 +185,8 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
             self.Time_management = TimeManagement()
             self.lobby_automator = LobbyAutomation(self.window_controller)
             self.runtime_control = runtime_control
+            self._shutdown_lock = threading.Lock()
+            self._shutdown_complete = False
             self.Stage_manager = StageManager(data, self.lobby_automator, self.window_controller, self.playstyle_info, self.get_latest_state, runtime_control=runtime_control)
             self.states_requiring_data = ["lobby"]
             self.no_detections_action_threshold = 60 * 8
@@ -190,6 +200,7 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
             )
             self.state_checker_stop_event = threading.Event()
             self.state_checker_thread = None
+            self._gameplay_inference_active = threading.Event()
             self.update_trophy_observer()
 
             # The checker thread reads every field below immediately. Create
@@ -243,11 +254,16 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
             self.cooldown_duration = 3 * 60
             self.window_controller.screenshot()
             discord_bot.set_window_controller(self.window_controller)
+            if self.runtime_control:
+                self.runtime_control.set_force_stop_callback(self.stop_gracefully)
             self.start_state_checker()
             print("Initialization complete, starting main loop.")
             self.picked_first_brawler = False
             self.time_since_checked_if_brawl_stars_crashed = time.time()
             self.check_if_brawl_stars_crashed_timer = time_config["check_if_brawl_stars_crashed"]
+            self._crash_check_lock = threading.Lock()
+            self._crash_check_in_progress = False
+            self._crash_recovery_requested = None
             self.ping_when_stuck = load_toml_as_dict("cfg/webhook_config.toml")["ping_when_stuck"]
 
         def update_trophy_observer(self):
@@ -281,6 +297,7 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                     print("Bot got stuck. User notified.")
                 print("Shutting down.")
                 self.window_controller.release_movement()
+                self.Play.health_monitor.close()
                 self.window_controller.close()
                 discord_bot.set_window_controller(None)
                 sys.exit(1)
@@ -302,11 +319,16 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
             return None
 
         def stop_gracefully(self):
-            cprint("Stop requested from UI - shutting down gracefully", "#AAE5A4")
-            self.stop_state_checker()
-            self.window_controller.release_movement()
-            self.window_controller.close()
-            discord_bot.set_window_controller(None)
+            with self._shutdown_lock:
+                if self._shutdown_complete:
+                    return
+                self._shutdown_complete = True
+                cprint("Stop requested from UI - releasing bot controls", "#AAE5A4")
+                self.stop_state_checker()
+                self.window_controller.release_movement()
+                self.Play.health_monitor.close()
+                self.window_controller.close()
+                discord_bot.set_window_controller(None)
 
         def start_state_checker(self):
             if self.state_checker_thread and self.state_checker_thread.is_alive():
@@ -374,6 +396,29 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                 try:
                     scan_now = time.monotonic()
                     previous_state = self.get_latest_state()
+                    if (
+                        previous_state == "match"
+                        and self._gameplay_inference_active.is_set()
+                    ):
+                        # Do not make OpenCV end-screen matching compete with
+                        # entity/wall inference. Wait briefly for its normal
+                        # completion, but never starve state detection if a
+                        # particularly slow inference exceeds the bound.
+                        # A low-end DirectML frame can legitimately take
+                        # 200-500 ms when entity and wall inference coincide.
+                        # Starting CPU-heavy template matching after 150 ms
+                        # made that already-slow frame stutter even more. Wait
+                        # for the normal gameplay pass, with a bounded escape
+                        # for a genuinely wedged provider.
+                        wait_deadline = time.monotonic() + max(
+                            0.5, self.match_state_check_interval
+                        )
+                        while (
+                            self._gameplay_inference_active.is_set()
+                            and time.monotonic() < wait_deadline
+                            and not self.state_checker_stop_event.is_set()
+                        ):
+                            self.state_checker_stop_event.wait(0.005)
                     # During a live match the only normal visual transition is
                     # an end screen, which the match-specific path already
                     # checks. Full menu scans here competed with entity
@@ -385,9 +430,21 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                     ):
                         previous_state = None
                         self.last_full_state_scan = scan_now
-                    self.observe_state(
-                        get_state(frame, previous_state=previous_state), frame_time
-                    )
+                    if (
+                        previous_state == "match"
+                        and self.Play.has_fresh_raw_player()
+                    ):
+                        # A raw player detection from the live gameplay window
+                        # rules out every end/menu screen. Once it disappears,
+                        # this gate expires within half a second and complete
+                        # state detection immediately resumes.
+                        self.Play.state_match_scans_avoided += 1
+                        self.observe_state("match", frame_time)
+                    else:
+                        self.observe_state(
+                            get_state(frame, previous_state=previous_state),
+                            frame_time,
+                        )
                 except Exception as e:
                     print(f"State checker failed: {e}")
                 # Menus need quick transitions; during a match, entity
@@ -423,9 +480,15 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                 self.wait_while_paused()
 
         def manage_time_tasks(self, frame):
+            self.Stage_manager._finish_lobby_trophy_scan(wait=False)
             if self.Time_management.state_check():
                 state = self.get_latest_state()
-                if state is not None:
+                # The match handler is an intentional no-op. Calling it twice
+                # per second only printed "State: match" from the gameplay
+                # thread; Windows console I/O can produce visible frame-time
+                # spikes on low-end machines. Menu/end handlers still repeat
+                # at their original cadence.
+                if state is not None and state != "match":
                     self.handle_detected_state(state)
             if self.Time_management.no_detections_check():
                 frame_data = self.Play.time_since_detections
@@ -444,22 +507,62 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                 print(f"Sent regular webhook ping after {self.webhook_ping_every_minutes} minutes.")
 
         def check_and_handle_brawl_stars_crash(self):
-            c_time = time.time()
-            if c_time - self.time_since_checked_if_brawl_stars_crashed > self.check_if_brawl_stars_crashed_timer:
-                try:
-                    opened_app = self.window_controller.device.app_current().package.strip()
-                    if not self.window_controller.is_brawl_stars_running(opened_app):
-                        print(f"Brawl stars has crashed, {opened_app} is the app opened ! Restarting...")
-                        self.window_controller.device.app_start(self.window_controller.BRAWL_STARS_PACKAGE)
-                        time.sleep(3)
-                        self.time_since_checked_if_brawl_stars_crashed = time.time()
-                    else:
-                        self.time_since_checked_if_brawl_stars_crashed = c_time
-                except AdbError:
-                    print("There was an error checking if Brawl Stars is running. Attempting to reconnect scrcpy...")
+            recovery = self._crash_recovery_requested
+            if recovery is not None:
+                self._crash_recovery_requested = None
+                recovery_type, opened_app = recovery
+                if recovery_type == "restart_app":
+                    print(
+                        f"Brawl stars has crashed, {opened_app} is the app "
+                        "opened ! Restarting..."
+                    )
+                    self.window_controller.device.app_start(
+                        self.window_controller.BRAWL_STARS_PACKAGE
+                    )
+                    time.sleep(3)
+                    self.time_since_checked_if_brawl_stars_crashed = time.time()
+                else:
+                    print(
+                        "There was an error checking if Brawl Stars is "
+                        "running. Attempting to reconnect scrcpy..."
+                    )
                     if not self.window_controller.reconnect_scrcpy():
                         print("Reconnect failed -- restarting Brawl Stars")
                         self.restart_brawl_stars()
+                return
+            c_time = time.time()
+            if (
+                c_time - self.time_since_checked_if_brawl_stars_crashed
+                    <= self.check_if_brawl_stars_crashed_timer
+                or self._crash_check_in_progress
+            ):
+                return
+            with self._crash_check_lock:
+                if self._crash_check_in_progress:
+                    return
+                self._crash_check_in_progress = True
+                # Reserve the interval before launching so a slow ADB response
+                # cannot enqueue duplicate checks from the hot loop.
+                self.time_since_checked_if_brawl_stars_crashed = c_time
+
+            def _check():
+                try:
+                    opened_app = self.window_controller.device.app_current().package.strip()
+                    if not self.window_controller.is_brawl_stars_running(opened_app):
+                        self._crash_recovery_requested = (
+                            "restart_app", opened_app
+                        )
+                except AdbError:
+                    self._crash_recovery_requested = ("reconnect", None)
+                finally:
+                    with self._crash_check_lock:
+                        self._crash_check_in_progress = False
+
+            threading.Thread(
+                target=_check,
+                daemon=True,
+                name="pyla-crash-checker",
+            ).start()
 
         def main(self):
             s_time = time.time()
@@ -535,7 +638,11 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                     self.stop_gracefully()
                     break
 
-                if abs(s_time - t_now) > 1:
+                # PowerShell/desktop-console flushes are synchronous and can
+                # briefly stall the gameplay loop. A five-second average is
+                # more useful on variable low-end hardware and cuts these
+                # non-gameplay writes by 80%.
+                if abs(s_time - t_now) > 5:
                     elapsed = t_now - s_time
                     if elapsed > 0:
                         print(f"{c / elapsed:.2f} FPS")
@@ -613,7 +720,11 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                     continue
                 self.last_entity_inference = inference_now
                 self.entity_inference_count += 1
-                self.Play.main(frame, brawler, self)
+                self._gameplay_inference_active.set()
+                try:
+                    self.Play.main(frame, brawler, self)
+                finally:
+                    self._gameplay_inference_active.clear()
                 c += 1
 
                 if inference_now - self.last_performance_report >= 30.0:
@@ -664,9 +775,27 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                     )
                     poison_total = self.Play.poison_compute_count + self.Play.poison_cache_count
                     poison_saved = 100.0 * self.Play.poison_cache_count / max(1, poison_total)
+                    entity_avg_ms, entity_max_ms = (
+                        self.Play.Detect_main_info.detection_timing_ms()
+                    )
+                    wall_detector = (
+                        self.Play.Detect_centered_tile_detector
+                        if self.Play.centered_wall_detection
+                        else self.Play.Detect_tile_detector
+                    )
+                    wall_avg_ms, wall_max_ms = (
+                        wall_detector.detection_timing_ms()
+                        if wall_detector is not None else (0.0, 0.0)
+                    )
                     print(
                         "Performance: "
+                        f"entity ms avg/max={entity_avg_ms:.1f}/"
+                        f"{entity_max_ms:.1f}, "
+                        f"wall ms avg/max={wall_avg_ms:.1f}/"
+                        f"{wall_max_ms:.1f}, "
                         f"entity frames avoided={entity_saved:.1f}%, "
+                        f"state match scans avoided="
+                        f"{self.Play.state_match_scans_avoided}, "
                         f"wall inferences avoided={wall_saved:.1f}%, "
                         f"poison scans avoided={poison_saved:.1f}%, "
                         f"A* cache hits={path_saved:.1f}%, "
@@ -721,6 +850,13 @@ def pyla_main(discord_bot, queue_data, stop_event=None, runtime_control=None):
                         f"{self.Play._last_output_movement[1]:.0f}), "
                         f"cube scans/cache={self.Play.power_cube_scans}/"
                         f"{self.Play.power_cube_cache_hits}, "
+                        f"shared HSV reuses={self.Play.shared_hsv_reuses}, "
+                        f"health OCR reads/requests="
+                        f"{self.Play.health_monitor.readings}/"
+                        f"{self.Play.health_monitor.requests}, "
+                        f"health={self.Play.health_monitor.value}, "
+                        f"health mode="
+                        f"{self.Play.persistent_data.get('health_mode')}, "
                         f"unsafe attacks/supers blocked="
                         f"{self.Play.unsafe_attack_requests_blocked}/"
                         f"{self.Play.unsafe_super_requests_blocked}, "

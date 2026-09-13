@@ -4,12 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="pyla-ui-token" content="{{ ui_api_token }}">
-    <title>PylaAI Public</title>
+    <title>Hamster Bot</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
     <link rel="icon" type="image/png" href="/api/assets/support/logo_no_background.png">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/tailwind.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dashboard_v3.css') }}">
 </head>
 <body>
     <div id="vfx-bg"></div>
@@ -78,5 +79,6 @@
     <script src="{{ url_for('static', filename='js/i18n_es_ko.js') }}"></script>
     <script src="{{ url_for('static', filename='js/i18n.js') }}"></script>
     <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/dashboard_v3.js') }}"></script>
 </body>
 </html>

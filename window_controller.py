@@ -124,8 +124,12 @@ class WindowController:
         configured_fps = str(config.get("capture_max_fps", "auto")).strip().lower()
         if configured_fps == "auto":
             logical_cpus = os.cpu_count() or 4
-            capture_fps = 15 if logical_cpus <= 4 else 20 if logical_cpus <= 8 else 30
+            # Decoding frames that the AI can never consume steals CPU/GPU
+            # time from ONNX and creates uneven frame pacing. Keep a modest
+            # freshness margin above the adaptive inference caps (10/12/16).
+            capture_fps = 12 if logical_cpus <= 4 else 15 if logical_cpus <= 8 else 20
         else:
+            logical_cpus = os.cpu_count() or 4
             capture_fps = max(1, min(120, int(configured_fps)))
         if self.max_fps != "auto":
             capture_fps = min(capture_fps, max(1, int(self.max_fps)))

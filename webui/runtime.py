@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import ctypes
 import re
 import sys
 import threading
@@ -66,6 +67,7 @@ class RuntimeControl:
         self._state_callback = state_callback
         self._stop_event = threading.Event()
         self._pause_requested = threading.Event()
+        self._force_stop_callback = None
 
     def request_pause(self):
         self._pause_requested.set()
@@ -76,6 +78,19 @@ class RuntimeControl:
     def request_stop(self):
         self._stop_event.set()
         self._pause_requested.clear()
+
+    def set_force_stop_callback(self, callback):
+        self._force_stop_callback = callback
+
+    def force_stop(self):
+        self.request_stop()
+        callback = self._force_stop_callback
+        if callback:
+            threading.Thread(
+                target=callback,
+                daemon=True,
+                name="pyla-force-cleanup",
+            ).start()
 
     def should_stop(self) -> bool:
         return self._stop_event.is_set()
@@ -230,26 +245,56 @@ class RuntimeManager:
                 return {"ok": True, "message": "Pyla is already stopped."}
 
             thread = self._thread
-            was_paused = self._state == "paused"
-            self.rt_control.request_stop()
+            control = self.rt_control
+            control.request_stop()
             self._state = "stopping"
 
-        if was_paused and thread:
-            thread.join(timeout=2)
-            if not thread.is_alive():
-                with self._lock:
-                    stopped_state = self._state
-                    self._thread = None
-                    self.rt_control = None
-                    self._session_started_at = None
-                    if self._state != "error":
-                        self._state = "idle"
-                        stopped_state = "idle"
-                if stopped_state == "error":
-                    return {"ok": False, "message": self._last_error or "Pyla stopped with an error."}
-                return {"ok": True, "message": "Pyla stopped."}
+        # Release movement/device resources immediately from the request
+        # thread. This does not depend on the gameplay loop reaching its next
+        # cooperative stop checkpoint.
+        try:
+            control.force_stop()
+        except Exception as error:
+            print(f"Immediate bot cleanup reported: {error}")
 
-        return {"ok": True, "message": "Stop requested. Pyla is shutting down."}
+        thread.join(timeout=1.5)
+        if thread.is_alive():
+            self._terminate_thread(thread)
+            thread.join(timeout=1.0)
+
+        if not thread.is_alive():
+            with self._lock:
+                stopped_state = self._state
+                self._thread = None
+                self.rt_control = None
+                self._session_started_at = None
+                if self._state != "error":
+                    self._state = "idle"
+                    stopped_state = "idle"
+            if stopped_state == "error":
+                return {"ok": False, "message": self._last_error or "Pyla stopped with an error."}
+            return {"ok": True, "message": "Pyla force-stopped.", "forced": True}
+
+        return {
+            "ok": False,
+            "message": "Pyla could not be force-stopped.",
+            "code": "FORCE_STOP_FAILED",
+        }
+
+    @staticmethod
+    def _terminate_thread(thread):
+        """Raise SystemExit in a stuck Python gameplay worker."""
+        if not thread or thread.ident is None:
+            return False
+        result = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_ulong(thread.ident), ctypes.py_object(SystemExit)
+        )
+        if result > 1:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(thread.ident), ctypes.c_void_p(0)
+            )
+            return False
+        return result == 1
 
     def get_logs(self) -> list[str]:
         with GLOBAL_LOGS_LOCK:

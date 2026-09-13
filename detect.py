@@ -1,5 +1,6 @@
 import os
 from functools import lru_cache
+import time
 
 import cv2
 import numpy as np
@@ -22,7 +23,7 @@ def _row_indices(length):
     return indices
 
 
-def _numpy_nms(boxes, scores, iou_threshold=0.6):
+def _numpy_nms(boxes, scores, iou_threshold=0.6, max_output=None):
     if len(boxes) == 0:
         return np.array([], dtype=np.int32)
 
@@ -40,6 +41,10 @@ def _numpy_nms(boxes, scores, iou_threshold=0.6):
     while order.size > 0:
         i = order[0]
         keep.append(i)
+        # Suppression is greedy in score order: later iterations cannot
+        # change this prefix. Stop once the caller has all returned boxes.
+        if max_output is not None and len(keep) >= max_output:
+            break
 
         remaining = order[1:]
         xx1 = np.maximum(x1[i], x1[remaining])
@@ -129,15 +134,17 @@ def _postprocess_raw(raw_output, conf_tresh=0.6, iou_thresh=0.6,
     # Build xyxy directly. This produces the same values as four temporaries
     # plus np.stack, while avoiding those full-size per-frame arrays.
     boxes_xyxy = np.empty_like(boxes_cxcywh)
-    half_width = boxes_cxcywh[:, 2] / 2
-    half_height = boxes_cxcywh[:, 3] / 2
-    np.subtract(boxes_cxcywh[:, 0], half_width,
+    # Use output columns 2/3 as temporary half-size buffers. This removes two
+    # additional arrays from every entity and wall inference postprocess.
+    np.multiply(boxes_cxcywh[:, 2], 0.5, out=boxes_xyxy[:, 2])
+    np.multiply(boxes_cxcywh[:, 3], 0.5, out=boxes_xyxy[:, 3])
+    np.subtract(boxes_cxcywh[:, 0], boxes_xyxy[:, 2],
                 out=boxes_xyxy[:, 0])
-    np.subtract(boxes_cxcywh[:, 1], half_height,
+    np.subtract(boxes_cxcywh[:, 1], boxes_xyxy[:, 3],
                 out=boxes_xyxy[:, 1])
-    np.add(boxes_cxcywh[:, 0], half_width,
+    np.add(boxes_cxcywh[:, 0], boxes_xyxy[:, 2],
            out=boxes_xyxy[:, 2])
-    np.add(boxes_cxcywh[:, 1], half_height,
+    np.add(boxes_cxcywh[:, 1], boxes_xyxy[:, 3],
            out=boxes_xyxy[:, 3])
 
     results = []
@@ -148,7 +155,8 @@ def _postprocess_raw(raw_output, conf_tresh=0.6, iou_thresh=0.6,
         cls_boxes = boxes_xyxy[cls_mask]
         cls_scores = confidences[cls_mask]
 
-        keep = _numpy_nms(cls_boxes, cls_scores, iou_thresh)
+        keep = _numpy_nms(cls_boxes, cls_scores, iou_thresh,
+                          max_output=max_detections_per_class)
         keep = keep[:max_detections_per_class]
 
         if len(keep) == 0:
@@ -188,6 +196,12 @@ class Detect:
         self.input_size = input_size
         self.max_detections_per_class = max(1, int(max_detections_per_class))
         self.model, self.device = self.load_model()
+        if self.device in ("DmlExecutionProvider", "CUDAExecutionProvider"):
+            # ONNX already occupies the GPU/driver and the emulator needs CPU
+            # time concurrently. Four OpenCV workers for a single resize can
+            # oversubscribe an 8-thread low-end host and create frame spikes;
+            # two workers produce the identical pixels with steadier latency.
+            cv2.setNumThreads(min(2, self.optimal_threads_amount))
         self.input_name = self.model.get_inputs()[0].name
         # Postprocessing intentionally consumes only the first model output.
         # Naming it avoids materializing unused outputs on multi-output exports.
@@ -203,6 +217,9 @@ class Detect:
         self._preprocess_target = None
         self._io_binding = None
         self._output_buffer = None
+        self.total_detection_seconds = 0.0
+        self.detection_calls = 0
+        self.maximum_detection_seconds = 0.0
         self._configure_static_io_binding()
 
     def _configure_static_io_binding(self):
@@ -356,6 +373,7 @@ class Detect:
         return results
 
     def detect_objects(self, img, conf_tresh=0.6):
+        detection_started = time.perf_counter()
         orig_h, orig_w = img.shape[:2]
 
         _, resized_w, resized_h = self.preprocess_image(img)
@@ -429,4 +447,17 @@ class Detect:
             else:
                 class_results.extend(coordinates)
 
+        elapsed = time.perf_counter() - detection_started
+        self.total_detection_seconds += elapsed
+        self.detection_calls += 1
+        if elapsed > self.maximum_detection_seconds:
+            self.maximum_detection_seconds = elapsed
         return results
+
+    def detection_timing_ms(self):
+        if not self.detection_calls:
+            return 0.0, 0.0
+        return (
+            self.total_detection_seconds * 1000.0 / self.detection_calls,
+            self.maximum_detection_seconds * 1000.0,
+        )

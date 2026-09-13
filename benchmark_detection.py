@@ -20,6 +20,12 @@ def main():
         fresh = object.__new__(baseline.Detect)
         fresh.input_size = (640, 640)
         fresh._padded_img_buffer = np.full((1, 3, 640, 640), 128 / 255, np.float32)
+        # Newer baselines cache resize geometry.  A deliberately fresh
+        # detector must initialise those fields just as __init__ does; without
+        # them this equivalence check tests an invalid object and crashes.
+        fresh._preprocess_source_shape = None
+        fresh._preprocess_target = None
+        fresh._normalization_scale = np.float32(1.0 / 255.0)
         np.testing.assert_allclose(fresh.preprocess_image(sample)[0], new.preprocess_image(sample)[0], atol=1e-7)
     print('Pixel equivalence and aspect-ratio padding: PASS', flush=True)
     for label, count, operation in [('preprocess', 200, 'preprocess_image'), ('full detection', 15, 'detect_objects')]:

@@ -59,13 +59,17 @@ def main():
         median_reduction = 100.0 * (
             baseline['work_median_ms'] - current['work_median_ms']
         ) / max(baseline['work_median_ms'], 1e-9)
-        target_met = cpu_reduction >= 40.0 and median_reduction >= 40.0
+        same_outputs = baseline['observations'] == current['observations']
+        target_met = (cpu_reduction >= 40.0 and median_reduction >= 40.0
+                      and same_outputs
+                      and current['work_p95_ms'] <= baseline['work_p95_ms'])
         print(f'CPU reduction: {cpu_reduction:.1f}%')
         print(f'Median work-time reduction: {median_reduction:.1f}%')
+        print(f'Per-frame entity/state equivalence: {same_outputs}')
         print(
             'OPTIMIZATION TARGET: '
             + ('PASS' if target_met else 'NOT YET')
-            + ' (requires >=40% CPU and median work-time reduction)'
+            + ' (requires >=40% CPU and median reduction, identical observations, and no p95 regression)'
         )
         return
     if args.version == 'baseline':
@@ -95,16 +99,24 @@ def main():
     durations = []
     player_frames = 0
     state_counts = {}
+    observations = []
+    component_ms = {'entity': [], 'walls': [], 'state': []}
     start_cpu, start_wall = time.process_time(), time.perf_counter()
     for i in range(args.cycles):
         frame = frames[i % len(frames)]
         tick = time.perf_counter()
         data = entity.detect_objects(frame, .55)
+        component_ms['entity'].append((time.perf_counter() - tick) * 1000)
         player_frames += bool(data.get('player'))
         # Fixed work schedule: 10 entity, 5 wall, 10 state checks / second.
         if i % 2 == 0 and (args.version == 'baseline' or data.get('player')):
+            wall_start = time.perf_counter()
             walls.detect_objects(frame, .6)
+            component_ms['walls'].append((time.perf_counter() - wall_start) * 1000)
+        state_start = time.perf_counter()
         state = states.get_state(frame)
+        component_ms['state'].append((time.perf_counter() - state_start) * 1000)
+        observations.append({'entities': data, 'state': state})
         state_counts[state] = state_counts.get(state, 0) + 1
         durations.append(time.perf_counter() - tick)
         time.sleep(max(0, .1 - durations[-1]))
@@ -116,6 +128,9 @@ def main():
         'work_median_ms': float(np.median(durations) * 1000),
         'work_p95_ms': float(np.percentile(durations, 95) * 1000),
         'player_frames': player_frames, 'states': state_counts,
+        'observations': observations,
+        'component_median_ms': {name: float(np.median(values)) if values else 0.0
+                                for name, values in component_ms.items()},
         'source_images': [p.name for p in paths],
     }), flush=True)
 

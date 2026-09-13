@@ -30,11 +30,13 @@ from utils import (
 )
 
 def get_brawler_stats(_player_info, _brawler_name):
-    return None, None
+    from utils import get_brawler_stats as lookup
+    return lookup(_player_info, _brawler_name)
 
 
 def get_player_info(_tag):
-    return None
+    from utils import get_player_info as lookup
+    return lookup(_tag)
 
 
 PATREON_LINK = "https://www.patreon.com/pyla/membership"
@@ -869,6 +871,7 @@ class WebDataService:
                 "latest_power_level": next((match["power_level"] for match in reversed(matches) if match["power_level"] is not None and match["power_level"] >= 0), None),
                 "trophy_points": trophy_points,
                 "recent_matches": list(reversed(matches[-8:])),
+                "matches": list(reversed(matches)),
                 "playstyles": [
                     {"name": name, "matches": count}
                     for name, count in sorted(playstyle_counts.items(), key=lambda item: (-item[1], item[0].lower()))

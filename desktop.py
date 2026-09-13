@@ -11,10 +11,10 @@ from typing import Any, Callable
 
 
 IS_WINDOWS = os.name == "nt"
-WINDOW_TITLE = "PylaAI"
+WINDOW_TITLE = "Hamster Bot"
 WINDOW_SIZE = (1440, 900)
-APP_ICON_PATH = Path(__file__).resolve().parent / "images" / "logo.ico"
-WINDOWS_APP_ID = "PylaAI.Desktop"
+APP_ICON_PATH = Path(__file__).resolve().parent / "images" / "hamster_setup.ico"
+WINDOWS_APP_ID = "HamsterBot.Desktop"
 _SW_HIDE = 0
 _BUNDLED_WEBVIEW_BINARIES = (
     Path("pythonnet/runtime/Python.Runtime.dll"),
@@ -192,7 +192,7 @@ def run_webview(
             local_url,
             width=window_size[0],
             height=window_size[1],
-            maximized=True,
+            maximized=False,
         )
         if on_close is not None:
             window.events.closed += lambda *_args: on_close()

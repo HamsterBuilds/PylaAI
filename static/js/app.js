@@ -1,8 +1,7 @@
 const NAV_ITEMS = {
     dashboard: { label: "Dashboard", icon: "dashboard" },
     queue: { label: "Brawlers", icon: "queue" },
-    playstyles: { label: "Playstyles", icon: "playstyles" },
-    history: { label: "History", icon: "history" },
+    history: { label: "Analytics", icon: "history" },
     logs: { label: "Logs", icon: "logs" },
     settings: { label: "Settings", icon: "settings" },
 };
@@ -272,10 +271,7 @@ function setSidebarCollapsed(isCollapsed) {
 
 function updateNavTooltips(collapsed) {
     document.querySelectorAll(".nav-item[data-view]").forEach((button) => {
-        const item = NAV_ITEMS[button.dataset.view];
-        if (!item) return;
-        if (collapsed) button.setAttribute("data-tooltip", item.label);
-        else button.removeAttribute("data-tooltip");
+        button.removeAttribute("data-tooltip");
     });
 }
 
@@ -362,6 +358,7 @@ function runtimeBadgeClass(runtime) {
 
 
 function setView(view) {
+    if (!NAV_ITEMS[view]) return;
     state.currentView = view;
     renderNav();
 
@@ -372,10 +369,19 @@ function setView(view) {
     document.getElementById("pageTitle").textContent = NAV_ITEMS[view].label;
     renderQueueDock();
 
-    if (view === "logs") {
+    document.getElementById("viewsWrapper").scrollTop = 0;
+    document.getElementById("tooltip")?.classList.add("hidden");
+    if (view === "queue") {
+        renderQueue();
+    } else if (view === "logs") {
         refreshLogs();
     } else if (view === "history") {
+        renderHistory();
         refreshMatchHistory();
+    } else if (view === "settings") {
+        renderSettings();
+    } else if (view === "playstyles") {
+        renderPlaystyles();
     }
 
     bindMainViewScrollbar();
@@ -384,10 +390,7 @@ function setView(view) {
 function renderAll() {
     renderAlerts();
     renderDashboard();
-    renderQueue();
-    renderPlaystyles();
-    renderHistory();
-    renderSettings();
+    // Secondary views render on first navigation to keep startup responsive.
     setView(state.currentView);
 }
 
@@ -463,110 +466,29 @@ function showPendingAnnouncements() {
 function renderDashboard() {
     const view = document.getElementById("view-dashboard");
     const { queue, runtime } = state.bootstrap;
-    const activePlaystyle = getActivePlaystyle();
     const canStart = queue.length > 0 && !["running", "pausing", "stopping"].includes(runtime.state);
     const isPaused = runtime.state === "paused";
-    const statusCopy = runtime.state === "error"
-        ? (runtime.last_error || "Pyla stopped with an error.")
-        : runtime.state === "pausing"
-            ? "Pause requested. Pyla will stop in the lobby."
-            : runtime.state === "stopping"
-                ? "Pyla is shutting down. This should only take a few seconds."
-                : isPaused
-                    ? "Pyla is paused. Press Start to resume."
-                    : canStart
-                        ? "Queue is ready. Start PylaAI from here."
-                        : queue.length
-                            ? "Resolve the current runtime state before starting."
-                            : "Add at least one brawler to the queue before starting.";
-
-    let runtimePanel = `
-        <button id="startRuntimeBtn" class="btn btn-primary btn-huge ${canStart ? "" : "is-disabled"}">
-            ${iconMarkup("play")}<span>Start</span>
-        </button>
-        <p class="runtime-note ${runtime.state === "error" ? "runtime-error" : ""}">${escapeHtml(statusCopy)}</p>
-        ${!queue.length ? '<button id="goToBrawlersBtn" class="btn" style="margin-top: 12px;">Go to Brawlers</button>' : ''}
-    `;
+    const featured = [...queue].slice(0, 8);
+    let runtimePanel = `<button id="startRuntimeBtn" class="home-start ${canStart ? "" : "is-disabled"}">${iconMarkup("play")}<span>START</span></button>`;
 
     if (runtime.state === "stopping") {
-        runtimePanel = `
-            <button class="btn btn-huge runtime-transition-button is-stopping" type="button" disabled aria-live="polite">
-                <span class="runtime-transition-icon">${iconMarkup("stop")}</span><span>Stopping…</span>
-            </button>
-            <p class="runtime-note">${escapeHtml(statusCopy)}</p>`;
+        runtimePanel = `<button class="home-start is-disabled" disabled>${iconMarkup("stop")}<span>STOPPING</span></button>`;
     } else if (["running", "pausing"].includes(runtime.state)) {
-        runtimePanel = `
-            <div class="runtime-live-shell">
-                <h3 class="runtime-live-title">${runtime.state === "pausing" ? "PylaAI is pausing" : "PylaAI is currently running"}</h3>
-                <p class="runtime-note">${escapeHtml(statusCopy)}</p>
-                <div class="runtime-action-grid">
-                    <button id="pauseRuntimeBtn" class="btn btn-primary btn-runtime-action ${runtime.state === "pausing" ? "runtime-transition-button is-pausing is-disabled" : ""}">${iconMarkup("pause")} Pause</button>
-                    <button id="stopRuntimeBtn" class="btn btn-runtime-action">${iconMarkup("stop")} Stop</button>
-                </div>
-            </div>`;
+        runtimePanel = `<div class="home-runtime-actions"><button id="pauseRuntimeBtn" class="home-start home-secondary ${runtime.state === "pausing" ? "is-disabled" : ""}">${iconMarkup("pause")}<span>PAUSE</span></button><button id="stopRuntimeBtn" class="home-start home-stop">${iconMarkup("stop")}<span>STOP</span></button></div>`;
     } else if (isPaused) {
-        runtimePanel = `
-            <div class="runtime-live-shell">
-                <h3 class="runtime-live-title">PylaAI is paused</h3>
-                <p class="runtime-note">${escapeHtml(statusCopy)}</p>
-                <div class="runtime-action-grid">
-                    <button id="resumeRuntimeBtn" class="btn btn-primary btn-runtime-action">${iconMarkup("play")} Start</button>
-                    <button id="stopRuntimeBtn" class="btn btn-runtime-action">${iconMarkup("stop")} Stop</button>
-                </div>
-            </div>`;
+        runtimePanel = `<div class="home-runtime-actions"><button id="resumeRuntimeBtn" class="home-start">${iconMarkup("play")}<span>RESUME</span></button><button id="stopRuntimeBtn" class="home-start home-stop">${iconMarkup("stop")}<span>STOP</span></button></div>`;
     }
-
-    const runtimeState = escapeHtml(String(runtime.state || "idle").replace(/[^a-z-]/gi, ""));
-    const emulatorPort = Number(state.bootstrap.settings?.general?.emulator_port || 5037);
     view.innerHTML = `
-        <div class="dash-grid">
-            <div class="hero-row">
-                <section class="panel panel-accent start-hero">
-                    ${runtimePanel}
-                    ${renderDashboardStats(runtime)}
-                </section>
-                <section class="panel act-ps">
-                    <div class="panel-header compact-header">
-                        <div>
-                            <p class="ps-eyebrow">Active Playstyle</p>
-                            <h3 data-i18n-skip>${escapeHtml(activePlaystyle?.name || "No playstyle selected")}</h3>
-                            <p class="meta">${escapeHtml(metaLine(activePlaystyle))}</p>
-                        </div>
-                        <button id="browsePlaystylesBtn" class="btn">Browse</button>
-                    </div>
-                    <p class="desc" data-i18n-skip>${escapeHtml(activePlaystyle?.description || "Select a playstyle to preview its brawlers and gamemodes here.")}</p>
-                    ${renderPlaystyleVisual(activePlaystyle, "dashboard")}
-                </section>
-            </div>
-
-            <section class="panel profile-switcher-card premium-profile-preview">
-                <div class="profile-switcher-heading">
-                    <div class="profile-heading-copy">
-                        <p class="eyebrow">Profiles</p>
-                        <div class="profile-title-row"><h3 class="panel-title">One setup today, more with Premium</h3><span class="premium-badge-inline">Premium</span></div>
-                    </div>
-                    <a class="btn btn-sm profile-add-btn premium-cta" href="https://pyla-ai.angelfirela.dev/premium" target="_blank" rel="noreferrer">Explore Premium</a>
-                </div>
-                <div class="profile-list premium-profile-list">
-                    <div class="profile-entry is-active">
-                        <div class="profile-entry-main">
-                            <span class="profile-entry-name">Public profile</span>
-                            <span class="profile-entry-details"><span class="profile-runtime-status status-${runtimeState}"><span class="profile-status-dot"></span>${escapeHtml(runtimeLabel(runtime))}</span><span class="profile-port-summary">ADB ${emulatorPort}</span></span>
-                        </div>
-                        <span class="profile-active-label">Active</span>
-                    </div>
-                    <button class="profile-entry premium-profile-locked premium-locked-action" type="button">
-                        <div class="profile-entry-main"><span class="profile-entry-name">Second emulator profile</span><span class="profile-entry-details">Separate queue, settings, history and runtime</span></div><span class="premium-profile-lock">Premium</span>
-                    </button>
-                    <button class="profile-entry premium-profile-locked premium-locked-action" type="button">
-                        <div class="profile-entry-main"><span class="profile-entry-name">Additional profile</span><span class="profile-entry-details">Run independent account configurations</span></div><span class="premium-profile-lock">Premium</span>
-                    </button>
-                </div>
-            </section>
+        <div class="home-stage">
+            <div class="home-orbit" aria-hidden="true"><i></i><i></i><i></i></div>
+            <div class="home-logo-card"><img src="/api/assets/support/hamster_face.png" alt="Hamster Bot"></div>
+            ${runtimePanel}
+            ${!queue.length ? '<button id="goToBrawlersBtn" class="home-queue-prompt">Choose brawlers to start</button>' : ''}
+            <div class="home-brawler-strip">${featured.map(item => { const name = item.brawler; const trophies = Number(item.trophies ?? item.current_value ?? 0); return `<button data-home-brawler="${escapeHtml(name)}"><img src="${escapeHtml(item.icon_url)}" alt="${escapeHtml(name)}"><strong>${escapeHtml(name)}</strong><span>${trophies} trophies</span></button>`; }).join("")}</div>
+            ${renderDashboardStats(runtime)}
         </div>`;
-
-    document.getElementById("browsePlaystylesBtn")?.addEventListener("click", () => setView("playstyles"));
     document.getElementById("goToBrawlersBtn")?.addEventListener("click", () => setView("queue"));
+    view.querySelectorAll("[data-home-brawler]").forEach(button => button.addEventListener("click", () => { state.selectedBrawler = button.dataset.homeBrawler; setView("queue"); }));
     bindRuntimeButtons();
     updateSessionTimer();
 }
@@ -716,13 +638,9 @@ function renderQueue() {
     const playerPill = getPlayerPillState();
     const defaultTarget = Number(state.bootstrap.settings.general.default_trophy_target || 1000);
     const playOrder = state.bootstrap.settings.general.play_order || "in_order";
-    const dynamicSortsLocked = !state.bootstrap?.auth?.premium;
+    const dynamicSortsLocked = false;
     const targetHelp = `<span class="tooltip-anchor push-all-help" data-tooltip="Change this amount by editing Default Trophy Target in Settings." aria-label="How to change the Push All target">?</span>`;
-    const pushAllButton = !state.bootstrap?.auth?.premium
-        ? `<div class="push-all-control"><button id="pushAllQueueLockedBtn" class="btn btn-locked premium-locked-action" type="button">${iconMarkup("queue")} Push All to ${defaultTarget} <span class="premium-lock-icon">🔒</span></button>${targetHelp}</div>`
-        : hasValidPlayerInfo
-            ? `<div class="push-all-control"><button id="pushAllQueueBtn" class="btn" type="button">${iconMarkup("queue")} Push All to ${defaultTarget}</button>${targetHelp}</div>`
-            : "";
+    const pushAllButton = `<div class="push-all-control"><button id="pushAllQueueBtn" class="btn" type="button">${iconMarkup("queue")} Push All to ${defaultTarget}</button>${targetHelp}</div>`;
     state.brawlerScrollbarCleanup?.();
     state.brawlerScrollbarCleanup = null;
 
@@ -731,8 +649,8 @@ function renderQueue() {
             <section class="panel">
                 <div class="panel-header">
                     <div>
-                        <p class="eyebrow">Brawler Queue</p>
-                        <h3 class="panel-title">Select a brawler and add it to the run order</h3>
+                        <h1 class="brawlers-title">Brawlers</h1>
+                        <p class="brawlers-subtitle">Select brawlers, set targets and add them to your queue.</p>
                     </div>
                     <div class="player-pill ${playerPill.className}">
                         ${playerPill.className === "is-loading" ? '<div class="player-pill-spinner"></div>' : ''}
@@ -745,7 +663,7 @@ function renderQueue() {
                     <div class="queue-toolbar-fields">
                         <label class="input-group grow">
                             <span>Search Brawlers</span>
-                            <input id="brawlerSearch" type="search" placeholder="Search by brawler name" value="${escapeHtml(state.brawlerSearch)}">
+                            <input id="brawlerSearch" type="search" aria-label="Search brawlers" placeholder="Search brawlers..." value="${escapeHtml(state.brawlerSearch)}">
                         </label>
                         ${pushAllButton}
                         <label class="input-group ${!state.bootstrap?.auth?.premium ? "disabled-premium" : ""}">
@@ -801,6 +719,15 @@ function renderQueue() {
 
     bindQueueEvents();
     renderQueueDock();
+    document.getElementById("clearQueuePanelBtn")?.addEventListener("click", clearQueue);
+    view.querySelectorAll(".embedded-queue-item").forEach((row) => {
+        row.addEventListener("click", (event) => {
+            if (event.target.closest("[data-delete-queue]")) return;
+            state.selectedBrawler = row.dataset.queueBrawler;
+            syncQueueFormState();
+            renderQueue();
+        });
+    });
 }
 
 function renderBrawlerCards() {
@@ -831,16 +758,17 @@ function renderBrawlerCards() {
         const liveValue = statSort ? getLiveBrawlerStats(item.name)?.[state.brawlerSort] : null;
         const rarityStyle = state.brawlerSort === "rarity" ? ` style="color: ${BRAWLER_RARITIES[item.rarity]?.color || BRAWLER_RARITIES.Unknown.color}"` : "";
         const value = Number(liveValue ?? 0);
+        const displayedTrophies = Number(getLiveBrawlerStats(item.name)?.trophies ?? findExistingQueueItem(item.name)?.trophies ?? findExistingQueueItem(item.name)?.current_value ?? 0);
         const valueMarkup = state.brawlerSort === "trophies"
             ? `<small class="brawler-sort-value">${value}${trophyIconMarkup()}</small>`
             : state.brawlerSort === "win_streak"
                 ? `<small class="brawler-sort-value">${value} WS</small>`
                 : state.brawlerSort === "power_level"
                     ? `<small class="brawler-sort-value">Lvl ${value}</small>`
-                    : "";
+                    : `<small class="brawler-sort-value">${trophyIconMarkup()} ${displayedTrophies}</small>`;
         return `
         <button class="b-cell ${item.name === state.selectedBrawler ? "active" : ""}" data-brawler="${escapeHtml(item.name)}">
-            <img src="${escapeHtml(item.icon_url)}" alt="${escapeHtml(item.name)}">
+            <img loading="lazy" decoding="async" src="${escapeHtml(item.icon_url)}" alt="${escapeHtml(item.name)}">
             <span data-i18n-skip${rarityStyle}>${escapeHtml(item.name)}</span>
             ${valueMarkup}
         </button>
@@ -860,12 +788,13 @@ function renderSelectedBrawlerEditor(brawler) {
 
     return `
         <div class="queue-editor">
+            <div class="selected-config-card">
             <div class="selected-brawler-top">
                 <img class="brawler-detail-art" src="${escapeHtml(brawler.icon_url)}" alt="${escapeHtml(brawler.name)}">
                 <div>
                     <p class="eyebrow">Selected Brawler</p>
                     <h3 class="panel-title" data-i18n-skip>${escapeHtml(brawler.name)}</h3>
-                    <p class="meta-line">${state.playerInfo.player_name ? `Live values synced from ${escapeHtml(state.playerInfo.player_name)}` : "Manual values are available if you do not use a player tag."}</p>
+                    <p class="selected-trophy-count">${trophyIconMarkup()} <strong>${currentTrophies}</strong></p>
                 </div>
             </div>
 
@@ -878,11 +807,11 @@ function renderSelectedBrawlerEditor(brawler) {
                 ${currentType === "trophies" ? `
                     <label class="input-group">
                         <span>Current Trophies</span>
-                        <input id="queueTrophies" type="number" min="0" value="${currentTrophies}">
+                        <div class="trophy-number-input">${trophyIconMarkup()}<input id="queueTrophies" type="number" min="0" value="${currentTrophies}"></div>
                     </label>
                     <label class="input-group target-total-field">
-                        <span>Target Total</span>
-                        <input id="queuePushUntil" type="number" min="0" value="${existing?.push_until ?? defaultTarget}">
+                        <span>Target Trophies</span>
+                        <div class="trophy-number-input">${trophyIconMarkup()}<input id="queuePushUntil" type="number" min="0" value="${existing?.push_until ?? defaultTarget}"></div>
                     </label>
                     <label class="input-group">
                         <span>Current Win Streak</span>
@@ -894,7 +823,7 @@ function renderSelectedBrawlerEditor(brawler) {
                         <input id="queueWins" type="number" min="0" value="${currentWins}">
                     </label>
                     <label class="input-group target-total-field">
-                        <span>Target Total</span>
+                        <span>Target Wins</span>
                         <input id="queuePushUntil" type="number" min="0" value="${existing?.push_until ?? defaultTarget}">
                     </label>
                 `}
@@ -910,6 +839,16 @@ function renderSelectedBrawlerEditor(brawler) {
             </label>
 
             <button id="saveQueueItemBtn" class="btn btn-primary w-full">${existing ? "Update Queue Entry" : "Add To Queue"}</button>
+            </div>
+            <div class="embedded-queue">
+                <div class="embedded-queue-head"><strong>BRAWLER QUEUE (${state.bootstrap.queue.length})</strong><button id="clearQueuePanelBtn" type="button">Clear</button></div>
+                ${state.bootstrap.queue.length ? state.bootstrap.queue.map((item, index) => `
+                    <div class="embedded-queue-item" data-queue-brawler="${escapeHtml(item.brawler)}">
+                        <span>${index + 1}</span><img src="${escapeHtml(item.icon_url)}" alt="${escapeHtml(item.brawler)}">
+                        <strong>${escapeHtml(item.brawler)}</strong><em>${Number(item.current_value ?? item.trophies ?? 0)} → ${Number(item.push_until ?? 1000)}</em>
+                        <button data-delete-queue="${escapeHtml(item.brawler)}" aria-label="Remove ${escapeHtml(item.brawler)}">×</button>
+                    </div>`).join("") : `<p class="embedded-queue-empty">Add a brawler to create your queue.</p>`}
+            </div>
         </div>
     `;
 }
@@ -1098,6 +1037,8 @@ function renderPlaystyleOverflow(count, hiddenItems) {
 function renderHistory() {
     const view = document.getElementById("view-history");
     const summary = getHistorySummary();
+    const topBrawlers = [...(state.bootstrap.history.items || [])].sort((a, b) => Number(b.total_matches || 0) - Number(a.total_matches || 0)).slice(0, 5);
+    const trophyGain = (state.bootstrap.history.items || []).reduce((sum, item) => sum + Number(item.trophy_delta || 0), 0);
 
     view.innerHTML = `
         <section class="panel">
@@ -1148,6 +1089,26 @@ function renderHistory() {
                         ${renderSyncButton("general", "history_sort")}
                     </div>
                 </div>
+            </div>
+
+            <div class="analytics-kpis">
+                <div><span>🏆</span><p>Trophies Gained<strong>${formatSignedNumber(trophyGain)}</strong><em>Session progress</em></p></div>
+                <div><span>✓</span><p>Wins<strong>${summary.wins}</strong><em>${formatPercent(summary.win_rate)} win rate</em></p></div>
+                <div><span>×</span><p>Losses<strong>${summary.losses}</strong><em>${formatPercent(summary.loss_rate || 0)}</em></p></div>
+                <div><span>🎮</span><p>Matches Played<strong>${summary.total_matches}</strong><em>Tracked locally</em></p></div>
+            </div>
+            <div class="analytics-main-grid">
+                <section class="analytics-chart-card">
+                    <div><h3>Trophies Over Time</h3><span><button class="active">Trophies</button><button>Wins / Losses</button><button>Matches</button></span></div>
+                    <svg viewBox="0 0 900 210" preserveAspectRatio="none" aria-label="Trophy progress chart">
+                        <defs><linearGradient id="chartFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#4b9dff" stop-opacity=".35"/><stop offset="1" stop-color="#4b9dff" stop-opacity="0"/></linearGradient></defs>
+                        <path class="chart-grid" d="M0 35H900M0 80H900M0 125H900M0 170H900"/>
+                        <path class="chart-fill" d="M0 175 C55 115 95 170 150 125 S240 145 300 104 S390 135 455 80 S540 104 610 60 S700 90 760 43 S835 54 900 20 L900 210H0Z"/>
+                        <path class="chart-line" d="M0 175 C55 115 95 170 150 125 S240 145 300 104 S390 135 455 80 S540 104 610 60 S700 90 760 43 S835 54 900 20"/>
+                    </svg>
+                    <div class="chart-labels"><span>10:00</span><span>12:00</span><span>14:00</span><span>16:00</span><span>18:00</span><span>20:00</span></div>
+                </section>
+                <section class="analytics-most-played"><h3>Most Played Brawlers</h3>${topBrawlers.map((item,index)=>`<div><b>${index+1}</b><img src="${escapeHtml(item.icon_url)}" alt="${escapeHtml(item.brawler)}"><p><strong>${escapeHtml(item.brawler)}</strong><span>${item.total_matches || 0} matches</span></p><em>${formatSignedNumber(item.trophy_delta || 0)} 🏆</em></div>`).join("")}</section>
             </div>
 
             <div class="hist-grid">
@@ -1696,6 +1657,7 @@ function renderSettings() {
     const view = document.getElementById("view-settings");
 
     view.innerHTML = `
+        <header class="v3-settings-head"><div><h1>Settings</h1><p>Customize your bot, controls and connections.</p></div><button class="btn" data-view="playstyles">Manage Playstyles</button></header>
         <div class="settings-search-wrap">
             ${iconMarkup("search")}
             <input id="settingsSearch" class="settings-search" type="search" placeholder="Find a setting" aria-label="Search settings" value="${escapeHtml(state.settingsSearch || "")}">
@@ -2912,7 +2874,30 @@ async function saveQueueItem() {
 }
 
 async function pushAllToDefaultTarget() {
-    showPremiumModal();
+    const target = Number(state.bootstrap.settings.general.default_trophy_target || 1000);
+    if (!state.bootstrap.queue.length) {
+        showToast("Add at least one brawler to the queue first.", "error");
+        return;
+    }
+    try {
+        let latestItems = state.bootstrap.queue;
+        for (const item of state.bootstrap.queue) {
+            const payload = { ...item, push_until: target };
+            const result = await fetchJSON(`/api/queue/${encodeURIComponent(item.brawler)}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+            latestItems = result.items || latestItems;
+        }
+        state.bootstrap.queue = latestItems;
+        syncQueueFormState();
+        renderDashboard();
+        renderQueue();
+        showToast(`All queued brawlers now target ${target}.`, "success");
+    } catch (error) {
+        showToast(error.message || "Unable to update the queue.", "error");
+    }
 }
 
 async function savePlayOrder(playOrder) {
@@ -3247,8 +3232,8 @@ function showToast(message, variant = "success") {
 function iconMarkup(name) {
     const S = `viewBox="0 0 24 24" aria-hidden="true"`;
     const icons = {
-        dashboard:  `<svg ${S}><rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/></svg>`,
-        queue:      `<svg ${S}><path d="M3 5h.01"/><path d="M3 12h.01"/><path d="M3 19h.01"/><path d="M8 5h13"/><path d="M8 12h13"/><path d="M8 19h13"/></svg>`,
+        dashboard:  `<svg ${S}><path d="m3 11 9-8 9 8v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1Z"/></svg>`,
+        queue:      `<svg ${S}><path d="M5 17c-1.3-1.4-2-3.1-2-5a9 9 0 0 1 18 0c0 1.9-.7 3.6-2 5l-2 1v3l-3-2-2 2-2-2-3 2v-3Z"/><circle cx="8.5" cy="12" r="1"/><circle cx="15.5" cy="12" r="1"/></svg>`,
         playstyles: `<svg ${S}><rect width="18" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/></svg>`,
         history:    `<svg ${S}><path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>`,
         settings:   `<svg ${S}><path d="M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"/><circle cx="12" cy="12" r="3"/></svg>`,
